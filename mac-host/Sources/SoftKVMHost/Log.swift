@@ -5,7 +5,8 @@ enum Log {
     private static let queue = DispatchQueue(label: "softkvm.log")
     private static let handle: FileHandle? = {
         let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Logs/SoftKVMHost.log")
+            .appendingPathComponent(ProcessInfo.processInfo.environment["SOFTKVM_PERF"] == "1"
+                                ? "Library/Logs/SoftKVMHost-perf.log" : "Library/Logs/SoftKVMHost.log")
         FileManager.default.createFile(atPath: url.path, contents: nil)
         return try? FileHandle(forWritingTo: url)
     }()

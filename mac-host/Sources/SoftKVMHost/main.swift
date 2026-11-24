@@ -9,14 +9,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let bitrateMbps = Int(ProcessInfo.processInfo.environment["SOFTKVM_BITRATE_MBPS"] ?? "") ?? 40
 
+        if !HostEnv.perf {  // benchmark instances stay invisible
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.title = "KVM"
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "SoftKVM host — port \(Proto.port)", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "SoftKVM host — port \(HostEnv.port)", action: nil, keyEquivalent: ""))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         item.menu = menu
         statusItem = item
+        }
 
         Log.info("SoftKVM host starting (bitrate \(bitrateMbps) Mbps)")
 

@@ -28,6 +28,7 @@
 #include <string.h>
 
 #include "keymap.h"
+#include "perf.h"
 
 #define PROTO_VERSION 0
 #define DEFAULT_PORT 47900
@@ -156,6 +157,7 @@ static void logf_(const char *fmt, ...) {
 static void put_u16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
 static void put_u32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = v >> (8 * i); }
 static uint32_t get_u32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint64_t get_u64(const uint8_t *p) { return get_u32(p) | (uint64_t)get_u32(p + 4) << 32; }
 
 static int send_all(SOCKET s, const uint8_t *buf, int len) {
     while (len > 0) {
@@ -273,6 +275,7 @@ static void request_keyframe(int idx) {
 
 static void handoff(Stream *s, AVFrame *f) {
     SDL_LockMutex(s->lock);
+    if (s->has_new) perf_dropped((int)(s - g_streams), (uint64_t)s->ready->pts);
     av_frame_unref(s->ready);
     av_frame_move_ref(s->ready, f);
     int notify = !s->has_new;
@@ -294,6 +297,7 @@ static void decode_video(int idx, uint8_t *payload, uint32_t len) {
 
     s->pkt->data = payload + 9;
     s->pkt->size = (int)len - 9;
+    s->pkt->pts = (int64_t)get_u64(payload);
     if (keyframe) s->pkt->flags |= AV_PKT_FLAG_KEY; else s->pkt->flags &= ~AV_PKT_FLAG_KEY;
     int ret = avcodec_send_packet(s->dec, s->pkt);
     if (ret < 0) {
@@ -304,6 +308,8 @@ static void decode_video(int idx, uint8_t *payload, uint32_t len) {
     }
     while ((ret = avcodec_receive_frame(s->dec, s->frame)) == 0) {
         AVFrame *out = s->frame;
+        int64_t pts = s->frame->pts;
+        perf_mark(idx, (uint64_t)pts, ST_DECODED, perf_now_us());
         if (s->frame->format == AV_PIX_FMT_D3D11) {
             av_frame_unref(s->sw);
             if (av_hwframe_transfer_data(s->sw, s->frame, 0) < 0) {
@@ -313,6 +319,8 @@ static void decode_video(int idx, uint8_t *payload, uint32_t len) {
             }
             av_frame_unref(s->frame);
             out = s->sw;
+            out->pts = pts;
+            perf_mark(idx, (uint64_t)pts, ST_XFER, perf_now_us());
         }
         handoff(s, out);
         s->frames++;
@@ -322,6 +330,7 @@ static void decode_video(int idx, uint8_t *payload, uint32_t len) {
     if (now - s->stats_start >= 5000) {
         double secs = (now - s->stats_start) / 1000.0;
         LOG("stream %d: %.1f fps, %.1f Mbps", idx, s->frames / secs, s->decoded_bytes * 8 / secs / 1e6);
+        perf_log_stats(idx, logf_);
         s->frames = 0;
         s->decoded_bytes = 0;
         s->stats_start = now;
@@ -433,11 +442,13 @@ static int net_thread(void *unused) {
         g_sock = s;
         SDL_UnlockMutex(g_send_lock);
         LOG("net: connected");
+        perf_connected();
         if (send_hello() < 0) goto disconnected;
 
         for (;;) {
             uint8_t hdr[8];
             if (recv_all(s, hdr, 8) < 0) break;
+            int64_t hdr_us = perf_now_us();
             uint8_t type = hdr[0], stream = hdr[1];
             uint32_t len = get_u32(hdr + 4);
             if (len > MAX_PAYLOAD) {
@@ -450,6 +461,8 @@ static int net_thread(void *unused) {
             }
             if (len && recv_all(s, buf, (int)len) < 0) break;
             memset(buf + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+            int64_t done_us = perf_now_us();
+            if (perf_handle_msg(type, stream, buf, len, done_us)) continue;
 
             switch (type) {
             case MSG_HELLO_ACK:
@@ -463,7 +476,12 @@ static int net_thread(void *unused) {
                 }
                 break;
             case MSG_VIDEO:
+                if (stream < g_nstreams && len >= 9)
+                    perf_on_video(stream, get_u64(buf), len, buf[8] & 1, hdr_us, done_us);
                 if (stream < g_nstreams) decode_video(stream, buf, len);
+                break;
+            case MSG_PING:
+                perf_on_ping(buf, len);
                 break;
             case MSG_AUDIO:
                 play_audio(buf, len);
@@ -494,6 +512,7 @@ static int net_thread(void *unused) {
         }
     disconnected:
         LOG("net: disconnected");
+        perf_disconnected();
         SDL_LockMutex(g_send_lock);
         closesocket(s);
         g_sock = INVALID_SOCKET;
@@ -569,6 +588,9 @@ static void render_stream(Stream *s) {
     if (fresh) av_frame_move_ref(f, s->ready);
     s->has_new = 0;
     SDL_UnlockMutex(s->lock);
+    int idx = (int)(s - g_streams);
+    uint64_t pts = (uint64_t)f->pts;
+    if (fresh) perf_mark(idx, pts, ST_FETCH, perf_now_us());
 
     if (fresh) {
         int fmt = f->format == AV_PIX_FMT_NV12 ? SDL_PIXELFORMAT_NV12
@@ -589,6 +611,7 @@ static void render_stream(Stream *s) {
             else
                 SDL_UpdateYUVTexture(s->tex, NULL, f->data[0], f->linesize[0], f->data[1], f->linesize[1],
                                      f->data[2], f->linesize[2]);
+            perf_mark(idx, pts, ST_UPLOADED, perf_now_us());
         }
     }
     av_frame_free(&f);
@@ -598,6 +621,13 @@ static void render_stream(Stream *s) {
     if (s->tex) SDL_RenderCopy(s->ren, s->tex, NULL, NULL);
     draw_cursor(s);
     SDL_RenderPresent(s->ren);
+    if (fresh) {
+        perf_mark(idx, pts, ST_PRESENTED, perf_now_us());
+        if (g_perf_bench_secs) {
+            perf_gpu_wait_renderer(s->ren);
+            perf_mark(idx, pts, ST_GPU_DONE, perf_now_us());
+        }
+    }
     s->dirty = 0;
     s->last_present = SDL_GetTicks();
 }
@@ -607,12 +637,19 @@ static int create_window(Stream *s, int idx) {
     SDL_GetDisplayBounds(s->monitor, &b);
     char title[64];
     snprintf(title, sizeof title, "SoftKVM %d", idx + 1);
-    s->win = SDL_CreateWindow(title, b.x, b.y, b.w, b.h, SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (g_perf_bench_secs) {
+        // Headless benchmark: a hidden window of the stream's size, never shown or focused.
+        b.x = b.y = 0;
+        b.w = s->w;
+        b.h = s->h;
+    }
+    s->win = SDL_CreateWindow(title, b.x, b.y, b.w, b.h, SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALLOW_HIGHDPI |
+                              (g_perf_bench_secs ? SDL_WINDOW_HIDDEN : 0));
     if (!s->win) {
         LOG("window: %s", SDL_GetError());
         return -1;
     }
-    SDL_SetWindowFullscreen(s->win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    if (!g_perf_bench_secs) SDL_SetWindowFullscreen(s->win, SDL_WINDOW_FULLSCREEN_DESKTOP);
     s->ren = SDL_CreateRenderer(s->win, -1, SDL_RENDERER_ACCELERATED);
     if (!s->ren) {
         LOG("renderer: %s", SDL_GetError());
@@ -867,7 +904,9 @@ int main(int argc, char **argv) {
     SDL_SetHint(SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED, "0");
     SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "0");
     SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "1");  // honor Windows pointer speed/acceleration
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
+    for (int i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], "--bench")) g_perf_bench_secs = atoi(argv[i + 1]);
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | (g_perf_bench_secs ? 0 : SDL_INIT_AUDIO)) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
@@ -880,6 +919,8 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--sw-decode")) g_force_sw = 1;
         else if (!strcmp(argv[i], "--start-hidden")) g_start_hidden = 1;
         else if (!strcmp(argv[i], "--mac-modifiers")) g_pc_style_modifiers = 0;
+        else if (!strcmp(argv[i], "--bench") && i + 1 < argc) i++;  // parsed above
+        else if (!strcmp(argv[i], "--csv") && i + 1 < argc) g_perf_csv = argv[++i];
         else if (argv[i][0] != '-' && !g_host[0]) snprintf(g_host, sizeof g_host, "%s", argv[i]);
         else { usage(); return 1; }
     }
@@ -896,6 +937,7 @@ int main(int argc, char **argv) {
             SDL_GetDisplayName(g_streams[i].monitor), g_streams[i].w, g_streams[i].h, g_streams[i].fps);
 
     SDL_AudioSpec want = {0}, have;
+    if (!g_perf_bench_secs) {
     want.freq = AUDIO_RATE;
     want.format = AUDIO_S16LSB;
     want.channels = 2;
@@ -903,6 +945,7 @@ int main(int argc, char **argv) {
     g_audio = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (g_audio) LOG("audio: output %d Hz, %d ch, %d-sample buffer", have.freq, have.channels, have.samples);
     else LOG("audio: no output device (%s)", SDL_GetError());
+    }
 
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -929,7 +972,7 @@ int main(int argc, char **argv) {
     // Global hotkey: works in PC mode too, when our windows are hidden.
     SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
     SDL_StopTextInput();
-    {
+    if (!g_perf_bench_secs) {
         SDL_SysWMinfo wm;
         SDL_VERSION(&wm.version);
         if (SDL_GetWindowWMInfo(g_streams[0].win, &wm) &&
@@ -940,9 +983,16 @@ int main(int argc, char **argv) {
             LOG("hotkey: could not register Ctrl+Alt+Space globally (in use?); it only works in Mac mode");
         }
     }
-    set_mac_mode(!g_start_hidden);
+    if (g_perf_bench_secs) {
+        g_mac_mode = 1;  // render, but never show windows or grab input
+        LOG("bench: headless run for %d s", g_perf_bench_secs);
+    } else {
+        set_mac_mode(!g_start_hidden);
+    }
 
+    perf_init(send_msg);
     SDL_Thread *net = SDL_CreateThread(net_thread, "net", NULL);
+    Uint32 bench_end = SDL_GetTicks() + (Uint32)g_perf_bench_secs * 1000;
 
     while (!SDL_AtomicGet(&g_quit)) {
         SDL_Event ev;
@@ -974,7 +1024,7 @@ int main(int argc, char **argv) {
                 } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                     check_focus = 1;
                 }
-            } else if (g_mac_mode) {
+            } else if (g_mac_mode && !g_perf_bench_secs) {
                 forward_input(&ev);
             }
         } while (SDL_PollEvent(&ev));
@@ -990,6 +1040,7 @@ int main(int argc, char **argv) {
 
         if (!g_mac_mode) continue;  // keep decoding in the background, draw when shown
         Uint32 now = SDL_GetTicks();
+        if (g_perf_bench_secs && (Sint32)(now - bench_end) >= 0) SDL_AtomicSet(&g_quit, 1);
         for (int i = 0; i < g_nstreams; i++) {
             Stream *st = &g_streams[i];
             SDL_LockMutex(st->lock);
@@ -1006,6 +1057,7 @@ int main(int argc, char **argv) {
     if (g_sock != INVALID_SOCKET) shutdown(g_sock, SD_BOTH);
     SDL_UnlockMutex(g_send_lock);
     SDL_WaitThread(net, NULL);
+    perf_finish();
     SDL_Quit();
     WSACleanup();
     return 0;

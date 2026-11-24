@@ -4,7 +4,7 @@ import VideoToolbox
 
 /// Hardware HEVC/H.264 encoder producing Annex B access units.
 final class VideoEncoder {
-    typealias Output = (_ annexB: Data, _ keyframe: Bool, _ pts: CMTime) -> Void
+    typealias Output = (_ annexB: Data, _ keyframe: Bool, _ pts: CMTime, _ timing: FrameTiming) -> Void
 
     let codec: Proto.Codec
     private var session: VTCompressionSession?
@@ -16,10 +16,10 @@ final class VideoEncoder {
 
         let codecType = codec == .hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
         var session: VTCompressionSession?
-        var lowLatency = true
+        var lowLatency = Tuning.encoderLowLatency
         var status = VTCompressionSessionCreate(
             allocator: nil, width: Int32(width), height: Int32(height), codecType: codecType,
-            encoderSpecification: Self.spec(lowLatency: true), imageBufferAttributes: nil,
+            encoderSpecification: Self.spec(lowLatency: Tuning.encoderLowLatency), imageBufferAttributes: nil,
             compressedDataAllocator: nil, outputCallback: nil, refcon: nil, compressionSessionOut: &session)
         if status != noErr {
             Log.info("encoder: low-latency mode unavailable (\(status)), falling back")
@@ -53,6 +53,7 @@ final class VideoEncoder {
             // Cap bursts at ~1.5x average over one second.
             set(kVTCompressionPropertyKey_DataRateLimits, [bitrate * 3 / 2 / 8, 1] as CFArray)
         }
+        Tuning.apply(to: session)
         VTCompressionSessionPrepareToEncodeFrames(session)
         Log.info("encoder: \(codec) \(width)x\(height)@\(fps) \(bitrate / 1_000_000) Mbps lowLatency=\(lowLatency)")
     }
@@ -63,21 +64,30 @@ final class VideoEncoder {
         return d as CFDictionary
     }
 
-    func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKeyframe: Bool) {
-        guard let session else { return }
+    /// `completion` runs once per call when VideoToolbox is done with the frame (encoded,
+    /// dropped or failed), on a VideoToolbox thread, after `output`.
+    func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKeyframe: Bool, timing: FrameTiming = FrameTiming(),
+                completion: (() -> Void)? = nil) {
+        guard let session else { completion?(); return }
         let props: CFDictionary? = forceKeyframe
             ? [kVTEncodeFrameOptionKey_ForceKeyFrame: true] as CFDictionary : nil
         let status = VTCompressionSessionEncodeFrame(
             session, imageBuffer: pixelBuffer, presentationTimeStamp: pts, duration: .invalid,
             frameProperties: props, infoFlagsOut: nil
         ) { [weak self] status, _, sampleBuffer in
+            defer { completion?() }
+            var timing = timing
+            timing.encodedUs = HostClock.nowMicros()
             guard let self, status == noErr, let sampleBuffer else {
                 if status != noErr { Log.info("encoder: frame error \(status)") }
                 return
             }
-            self.emit(sampleBuffer)
+            self.emit(sampleBuffer, timing: timing)
         }
-        if status != noErr { Log.info("encoder: encode call failed \(status)") }
+        if status != noErr {
+            Log.info("encoder: encode call failed \(status)")
+            completion?()
+        }
     }
 
     func invalidate() {
@@ -94,7 +104,7 @@ final class VideoEncoder {
 
     private static let startCode: [UInt8] = [0, 0, 0, 1]
 
-    private func emit(_ sb: CMSampleBuffer) {
+    private func emit(_ sb: CMSampleBuffer, timing: FrameTiming) {
         let keyframe = Self.isKeyframe(sb)
         var out = Data()
         if keyframe, let fd = sb.formatDescription {
@@ -117,7 +127,7 @@ final class VideoEncoder {
             out.append(raw.advanced(by: offset).assumingMemoryBound(to: UInt8.self), count: len)
             offset += len
         }
-        output(out, keyframe, sb.presentationTimeStamp)
+        output(out, keyframe, sb.presentationTimeStamp, timing)
     }
 
     private func appendParameterSets(_ fd: CMFormatDescription, to out: inout Data) {

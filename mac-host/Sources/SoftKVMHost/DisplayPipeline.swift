@@ -6,13 +6,13 @@ import ScreenCaptureKit
 
 /// One virtual display -> ScreenCaptureKit capture -> hardware encoder -> sink.
 final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
-    typealias Sink = (_ annexB: Data, _ keyframe: Bool, _ ptsMicros: UInt64) -> Void
+    typealias Sink = (_ annexB: Data, _ keyframe: Bool, _ ptsMicros: UInt64, _ timing: FrameTiming) -> Void
     /// Interleaved s16le stereo PCM at `Proto.audioSampleRate`.
     typealias AudioSink = (_ pcm: Data, _ ptsMicros: UInt64) -> Void
 
     let index: Int
     let request: Proto.DisplayRequest
-    let codec: Proto.Codec = .hevc
+    let codec: Proto.Codec = Tuning.codec
 
     private let queue: DispatchQueue
     private let sink: Sink
@@ -44,7 +44,7 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         self.request = request
         self.bitrate = bitrate
         self.sink = sink
-        self.audioSink = audioSink
+        self.audioSink = Tuning.noAudio ? nil : audioSink
         self.queue = DispatchQueue(label: "softkvm.display.\(index)", qos: .userInteractive)
         self.audioQueue = DispatchQueue(label: "softkvm.audio.\(index)", qos: .userInteractive)
     }
@@ -55,8 +55,8 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         let index = self.index
         let (created, id): (AnyObject?, CGDirectDisplayID) = await MainActor.run {
             var id: CGDirectDisplayID = 0
-            let obj = SKCreateVirtualDisplay("SoftKVM \(index + 1)", UInt32(w), UInt32(h), Double(fps),
-                                             UInt32(index + 1), &id) as AnyObject?
+            let obj = SKCreateVirtualDisplay(HostEnv.displayName(index), UInt32(w), UInt32(h), Double(fps),
+                                             HostEnv.displaySerial(index), &id) as AnyObject?
             return (obj, id)
         }
         guard let created, id != 0 else {
@@ -81,8 +81,8 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         }
 
         encoder = try VideoEncoder(width: w, height: h, fps: fps, bitrate: bitrate, codec: codec) {
-            [weak self] data, key, pts in
-            self?.deliver(data, keyframe: key, pts: pts)
+            [weak self] data, key, pts, timing in
+            self?.deliver(data, keyframe: key, pts: pts, timing: timing)
         }
 
         let config = SCStreamConfiguration()
@@ -94,6 +94,7 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         config.colorSpaceName = CGColorSpace.sRGB
         config.showsCursor = false  // the client draws the cursor locally (no video latency)
         config.queueDepth = 5
+        Tuning.apply(to: config)
         if audioSink != nil {
             config.capturesAudio = true
             config.sampleRate = Proto.audioSampleRate
@@ -128,6 +129,7 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             encoder?.invalidate()
             encoder = nil
             lastBuffer = nil
+            waiting = nil
         }
         // Releasing the object removes the virtual display.
         DispatchQueue.main.async { [virtualDisplay] in _ = virtualDisplay }
@@ -159,7 +161,12 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         lastBuffer = pb
         lastFrameTime = CFAbsoluteTimeGetCurrent()
         refreshesLeft = 8
-        encode(pb)
+        var timing = FrameTiming()
+        timing.callbackUs = HostClock.nowMicros()
+        if let ticks = attachments.first?[.displayTime] as? UInt64 {
+            timing.captureUs = HostClock.micros(fromTicks: ticks)
+        }
+        encode(pb, timing: timing)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -226,18 +233,45 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
 
     private func encodeLast() {
         guard let pb = lastBuffer else { return }
-        encode(pb)
+        var timing = FrameTiming()
+        timing.callbackUs = HostClock.nowMicros()
+        timing.refresh = true
+        encode(pb, timing: timing)
     }
 
-    private func encode(_ pb: CVPixelBuffer) {
+    // Encoder admission: at most `Tuning.maxInFlight` frames inside VideoToolbox. When the
+    // encoder is busy, a newer capture replaces the waiting one instead of queueing behind it,
+    // so a saturated encoder costs frame rate rather than piling up latency (on `queue`).
+    private var inFlight = 0
+    private var waiting: (CVPixelBuffer, FrameTiming)?
+
+    private func encode(_ pb: CVPixelBuffer, timing: FrameTiming) {
+        guard let encoder else { return }
+        if Tuning.maxInFlight > 0, inFlight >= Tuning.maxInFlight {
+            waiting = (pb, timing)
+            return
+        }
+        inFlight += 1
         let force = keyframePending
         keyframePending = false
-        encoder?.encode(pb, pts: CMClockGetTime(CMClockGetHostTimeClock()), forceKeyframe: force)
+        var timing = timing
+        timing.submitUs = HostClock.nowMicros()
+        encoder.encode(pb, pts: CMClockGetTime(CMClockGetHostTimeClock()), forceKeyframe: force, timing: timing) {
+            [weak self] in
+            guard let self else { return }
+            self.queue.async {
+                self.inFlight -= 1
+                if let (pb, t) = self.waiting {
+                    self.waiting = nil
+                    self.encode(pb, timing: t)
+                }
+            }
+        }
     }
 
-    private func deliver(_ data: Data, keyframe: Bool, pts: CMTime) {
+    private func deliver(_ data: Data, keyframe: Bool, pts: CMTime, timing: FrameTiming) {
         let micros = UInt64(max(0, CMTimeGetSeconds(pts)) * 1_000_000)
-        sink(data, keyframe, micros)
+        sink(data, keyframe, micros, timing)
         framesOut += 1
         bytesOut += data.count
         let now = CFAbsoluteTimeGetCurrent()
