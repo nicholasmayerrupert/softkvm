@@ -20,3 +20,4 @@ __pycache__/
 pc-client/dist-installer/
 pc-client/build/
 mac-host/dist/
+tools/deploy.env
