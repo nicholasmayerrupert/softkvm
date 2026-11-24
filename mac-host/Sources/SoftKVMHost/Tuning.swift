@@ -14,7 +14,8 @@ enum Tuning {
     /// SOFTKVM_NO_AUDIO=1 disables system audio capture.
     static let noAudio = env["SOFTKVM_NO_AUDIO"] == "1"
     /// SOFTKVM_MAX_INFLIGHT: frames allowed inside the encoder per display (0 = unlimited).
-    static let maxInFlight = int("SOFTKVM_MAX_INFLIGHT") ?? 0
+    /// 1 keeps latency flat when the encoder is saturated (two 1440p+ streams on an M1 Pro).
+    static let maxInFlight = int("SOFTKVM_MAX_INFLIGHT") ?? 1
 
     /// SOFTKVM_ENC_LOWLAT=0 uses VideoToolbox's regular rate control instead of low-latency mode.
     static let encoderLowLatency = env["SOFTKVM_ENC_LOWLAT"] != "0"

@@ -23,6 +23,7 @@ STAGES = [
     ("fetch->uploaded", "fetch", "uploaded"),
     ("uploaded->presented", "uploaded", "presented"),
     ("presented->gpu_done", "presented", "gpu_done"),
+    ("capture->queued (host)", "cap", "queued"),
     ("recv->presented (client)", "recv", "presented"),
     ("capture->presented (E2E)", "cap", "presented"),
     ("capture->gpu_done (E2E)", "cap", "gpu_done"),

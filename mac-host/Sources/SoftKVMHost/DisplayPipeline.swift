@@ -88,7 +88,10 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         let config = SCStreamConfiguration()
         config.width = w
         config.height = h
-        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        // No minimum interval: the virtual display already runs at `fps`, and a 1/fps minimum
+        // makes ScreenCaptureKit skip frames that arrive a little early (jitter), which cost
+        // ~10 fps and queued frames behind the encoder.
+        config.minimumFrameInterval = .zero
         config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
         config.colorSpaceName = CGColorSpace.sRGB
