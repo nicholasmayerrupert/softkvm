@@ -74,3 +74,42 @@ Client → host
 
 **Test without a PC**: `python3 tools/recv.py <mac-ip> --seconds 10` dumps the stream to
 `tools/out/stream0.h265`.
+
+## Latency instrumentation and benchmarks
+
+The host timestamps every frame on its own clock and the client estimates the clock offset,
+so each stage can be measured end to end. All of this is ignored by older peers.
+
+| type | dir | name | payload |
+|---|---|---|---|
+| `0x05` | H→C | PING | now optionally `u64 host_us` (host clock); clients that see it start time sync |
+| `0x20` | H→C | FRAME_TIMING | sent before each VIDEO: `u64 pts_us` (matches VIDEO), `u64 capture_us` (ScreenCaptureKit display time), `u64 callback_us`, `u64 encoded_us`, `u64 queued_us`, `u32 unsent_bytes`, `u32 flags` (bit 0 = idle refresh), `u64 submit_us` (handed to the encoder) |
+| `0xA0` | C→H | TIME_REQUEST | `u64 client_us` |
+| `0x21` | H→C | TIME_RESPONSE | `u64 client_us` (echo), `u64 host_us` |
+
+The client logs a latency line per stream every 5 s (capture→present p50/p95/p99, plus the
+host, network and client shares).
+
+**Benchmarking next to a live setup** (nothing visible on either machine):
+
+```
+# Mac: a second, invisible host on another port with an animated test pattern
+open -n --env SOFTKVM_PORT=47910 --env SOFTKVM_PERF=1 --env SOFTKVM_ANIMATE=1 mac-host/SoftKVMHost.app
+# PC: headless client (hidden windows, no audio, no input), 20 s
+softkvm.exe MAC --port 47910 --monitor 0:2560x1440@60 --monitor 0:2560x1600@60 --bench 20 --csv run1
+python3 tools/perf_analyze.py run1          # p50/p95/p99 per stage, E2E, frame pacing
+```
+
+`SOFTKVM_PERF=1` names the test displays "SoftKVM perf N" (own serials), tucks them into a
+corner of the arrangement for the app's lifetime only, skips the menu-bar item, input
+injection and arrangement mirroring, and logs to `~/Library/Logs/SoftKVMHost-perf.log`.
+
+Host knobs (environment): `SOFTKVM_CODEC=h264|hevc`, `SOFTKVM_MAX_INFLIGHT` (frames inside
+the encoder per display, default 1, 0 = unlimited), `SOFTKVM_SCK_FPS` (ScreenCaptureKit
+minimum frame interval as fps, default 0 = every frame), `SOFTKVM_SCK_QUEUE_DEPTH`,
+`SOFTKVM_SCK_PIXFMT=bgra|420f`, `SOFTKVM_ENC_LOWLAT=0`, `SOFTKVM_NO_AUDIO=1`,
+`SOFTKVM_ANIMATE_SPEED` (points/s).
+
+Client flags: `--present flip|tearing|vsync` (default flip), `--sdl-render` (old copy path),
+and for benchmarks `--bench N`, `--csv PREFIX`, `--snapshot FILE.bmp`, `--gpu-wait`,
+`--decode-sync`.
