@@ -12,6 +12,8 @@
 
 int g_perf_bench_secs;
 const char *g_perf_csv;
+int g_perf_gpu_wait;
+const char *g_perf_snapshot;
 
 typedef struct {
     int stream;
@@ -281,4 +283,19 @@ void perf_gpu_wait_renderer(SDL_Renderer *ren) {
     if (!dev) return;
     perf_gpu_wait_d3d11(dev);
     ID3D11Device_Release(dev);
+}
+
+void perf_log_cpu(void (*log)(const char *fmt, ...)) {
+    static int64_t start_wall;
+    static ULONGLONG start_cpu;
+    FILETIME c, e, k, u;
+    GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+    ULONGLONG cpu = (((ULONGLONG)k.dwHighDateTime << 32 | k.dwLowDateTime) +
+                     ((ULONGLONG)u.dwHighDateTime << 32 | u.dwLowDateTime)) / 10;  // µs
+    int64_t now = perf_now_us();
+    if (start_wall && log)
+        log("cpu: %.1f%% of one core over %.1f s", 100.0 * (double)(cpu - start_cpu) / (double)(now - start_wall),
+            (now - start_wall) / 1e6);
+    start_wall = now;
+    start_cpu = cpu;
 }

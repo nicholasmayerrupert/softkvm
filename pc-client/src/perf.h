@@ -25,7 +25,9 @@ enum {
 typedef int (*perf_send_fn)(uint8_t type, uint8_t stream, const uint8_t *payload, uint32_t len);
 
 extern int g_perf_bench_secs;     // --bench N: headless run for N seconds, then exit
-extern const char *g_perf_csv;    // --csv PREFIX: write PREFIX-frames.csv and PREFIX-sync.csv
+extern const char *g_perf_csv;
+extern const char *g_perf_snapshot;  // --snapshot FILE.bmp: bench only, one frame of window 0
+extern int g_perf_gpu_wait;      // --gpu-wait: bench only, sync with the GPU after each frame (adds stalls)    // --csv PREFIX: write PREFIX-frames.csv and PREFIX-sync.csv
 
 int64_t perf_now_us(void);
 void perf_init(perf_send_fn send);
@@ -48,6 +50,9 @@ void perf_log_stats(int stream, void (*log)(const char *fmt, ...));
 void perf_gpu_wait_d3d11(void *id3d11device);
 struct SDL_Renderer;
 void perf_gpu_wait_renderer(struct SDL_Renderer *ren);
+
+// Logs process CPU use since the previous call (first call just starts the clock).
+void perf_log_cpu(void (*log)(const char *fmt, ...));
 
 // Writes the CSVs (bench mode). Safe to call once at exit.
 void perf_finish(void);

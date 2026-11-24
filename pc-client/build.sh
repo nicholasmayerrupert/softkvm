@@ -8,7 +8,7 @@ FF=$(ls -d deps/ffmpeg-*-win64-lgpl-shared-* | head -1)
 mkdir -p dist
 x86_64-w64-mingw32-gcc -O2 -Wall -Wextra -Wno-unused-parameter -std=c11 \
   -I"$SDL/include/SDL2" -I"$FF/include" \
-  src/main.c src/keymap.c src/perf.c -o dist/softkvm.exe \
+  src/main.c src/keymap.c src/perf.c src/d3d_present.c -o dist/softkvm.exe \
   -L"$SDL/lib" -L"$FF/lib" \
   -lmingw32 -lSDL2 -lavcodec -lavutil -lws2_32 -ld3d11 -ldxgi -luuid \
   -static-libgcc -Wl,--subsystem,windows
