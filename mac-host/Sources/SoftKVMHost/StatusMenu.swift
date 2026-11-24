@@ -41,6 +41,7 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let state = AppState.shared
 
         menu.addItem(header("SoftKVM Host"))
+        if let error = state.listenerError { menu.addItem(info("⚠︎ \(error)")) }
         if let name = state.clientName {
             let addr = state.clientAddress.map { " (\($0))" } ?? ""
             menu.addItem(info("Connected to \(name)\(addr)"))
@@ -166,7 +167,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         let paired = TrustStore.shared.all
         guard sender.tag < paired.count else { return }
         let pc = paired[sender.tag]
-        if PairingPrompt.confirmForget(name: pc.name) { server.unpair(key: pc.publicKey) }
+        if PairingPrompt.confirmForget(name: pc.name), !server.unpair(key: pc.publicKey) {
+            let alert = NSAlert()
+            alert.messageText = "Couldn't save the change"
+            alert.informativeText = "\(pc.name) is disconnected for now, but it may be trusted again after SoftKVM restarts. "
+                + "Check the log for details."
+            alert.runModal()
+        }
     }
 
     @objc private func openScreenRecordingSettings() {

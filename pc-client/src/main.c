@@ -119,6 +119,10 @@ static SDL_atomic_t g_net_stop;
 static SDL_atomic_t g_connected;
 static SDL_atomic_t g_session_gen;
 static SDL_atomic_t g_paused;  // disconnected on purpose: don't reconnect until the user asks
+// An address discovery suggested for the active device (g_shared_lock). It's only a hint: the
+// net thread tries it, and it's saved only once a handshake there proves the device's key.
+static char g_hint_addr[64];
+static int g_hint_port;
 static SDL_atomic_t g_local_consent;  // pairing a new device: 0 asked, 1 user said yes, -1 no
 static int g_code_asking;              // the pairing window is waiting for that answer (main thread)
 static Uint32 g_resume_mac_until;      // a drop while on the device: go back to it if we reconnect by then
@@ -131,7 +135,7 @@ static Device g_session_dev;
 static SkCipher g_cipher;      // send side guarded by g_send_lock; receive side net thread only
 
 // Per-device runtime state (main thread).
-typedef struct { int state; char status[160]; Uint32 last_seen; } DeviceRuntime;
+typedef struct { int state; char status[160]; Uint32 last_seen; char hint_addr[64]; int hint_port; } DeviceRuntime;
 static DeviceRuntime g_devrt[CFG_MAX_DEVICES];
 
 // Every PC monitor (main thread).
@@ -160,6 +164,8 @@ enum {
     NE_BYE,           // arg = reason, text = detail
     NE_VERSION,       // text = the device's app version
     NE_KEY_CHANGED,
+    NE_ADDR_PROVEN,   // text = address, arg = port: the hint worked
+    NE_HINT_BAD,      // the hinted address wasn't the device
 };
 typedef struct {
     int gen, code, arg, platform;
@@ -567,6 +573,8 @@ static int send_hello(void) {
     return send_msg(MSG_HELLO, 0, buf, 8 + g_nstreams * 20);
 }
 
+static int g_trying_hint;  // net thread: the current attempt is at an unproven (discovered) address
+
 static int net_should_stop(void) { return SDL_AtomicGet(&g_quit) || SDL_AtomicGet(&g_net_stop); }
 
 /// Sleeps up to ms, waking early if the session is stopping.
@@ -633,6 +641,10 @@ static int client_handshake(SOCKET s, int gen) {
     if (hh.proto != SK_PROTO_VERSION || hh.status == SK_STATUS_VERSION_MISMATCH) {
         LOG("net: version mismatch: %s runs SoftKVM %s (protocol v%u), this PC runs %s (v%d)", hh.name, hh.version,
             hh.proto, SOFTKVM_VERSION, SK_PROTO_VERSION);
+        if (g_trying_hint) {  // an unproven address: forget the hint, keep trying the known one
+            post_net(gen, NE_HINT_BAD, 0, NULL, NULL);
+            return -1;
+        }
         SDL_AtomicSet(&g_paused, 1);
         post_net(gen, NE_VERSION, 0, NULL, &hh);
         return -1;
@@ -642,7 +654,11 @@ static int client_handshake(SOCKET s, int gen) {
         char want[17], got[17];
         sk_device_id(g_session_dev.pub, want);
         sk_device_id(hh.static_pub, got);
-        LOG("net: %s presented key %s, expected %s; refusing", g_session_dev.addr, got, want);
+        LOG("net: the device at that address presented key %s, expected %s; refusing", got, want);
+        if (g_trying_hint) {
+            post_net(gen, NE_HINT_BAD, 0, NULL, NULL);
+            return -1;
+        }
         SDL_AtomicSet(&g_paused, 1);
         post_net(gen, NE_KEY_CHANGED, 0, NULL, &hh);
         return -1;
@@ -659,6 +675,15 @@ static int client_handshake(SOCKET s, int gen) {
     char id[17];
     sk_device_id(hh.static_pub, id);
     LOG("net: secure channel to %s (%s, SoftKVM %s)", hh.name, id, hh.version);
+    if (g_trying_hint && g_session_dev.has_key) {  // the key matched: the hinted address is real
+        char addr[64];
+        int port;
+        SDL_LockMutex(g_shared_lock);
+        snprintf(addr, sizeof addr, "%s", g_hint_addr);
+        port = g_hint_port;
+        SDL_UnlockMutex(g_shared_lock);
+        post_net(gen, NE_ADDR_PROVEN, port, addr, NULL);
+    }
     post_net(gen, NE_HOST, 0, NULL, &hh);
     return 0;
 }
@@ -676,8 +701,12 @@ static int net_thread(void *unused) {
         char host[64];
         int port;
         SDL_LockMutex(g_shared_lock);
-        snprintf(host, sizeof host, "%s", g_session_dev.addr);
-        port = g_session_dev.port;
+        // Alternate between the last proven address and a discovery hint, if there is one.
+        static int attempt;
+        int use_hint = g_hint_addr[0] && (attempt++ % 2 == 1 || !g_session_dev.addr[0]);
+        snprintf(host, sizeof host, "%s", use_hint ? g_hint_addr : g_session_dev.addr);
+        port = use_hint ? g_hint_port : g_session_dev.port;
+        g_trying_hint = use_hint;
         SDL_UnlockMutex(g_shared_lock);
         if (!host[0]) {
             net_sleep(500);
@@ -1301,6 +1330,14 @@ static int is_local_hotkey(const SDL_Keysym *k) {
     return 0;
 }
 
+/// Peer-supplied names go into menus and config.ini: no control characters (a newline would
+/// inject config lines), at most 40 characters.
+static void sanitize_name(char *s) {
+    for (char *p = s; *p; p++)
+        if ((unsigned char)*p < 0x20 || *p == 0x7f) *p = ' ';
+    if (strlen(s) > 40) s[40] = 0;
+}
+
 static void usage(void) {
     fprintf(stderr,
             "usage: softkvm [DEVICE_ADDRESS] [--port P] [--monitor N[:WxH@FPS]]... [--sw-decode]\n"
@@ -1438,6 +1475,8 @@ static void start_session(void) {
     }
     SDL_LockMutex(g_shared_lock);
     g_session_dev = *d;
+    snprintf(g_hint_addr, sizeof g_hint_addr, "%s", g_devrt[g_cfg.active].hint_addr);
+    g_hint_port = g_devrt[g_cfg.active].hint_port;
     SDL_UnlockMutex(g_shared_lock);
     set_dev_state(g_cfg.active, DEV_CONNECTING, "");
     SDL_AtomicSet(&g_net_stop, 0);
@@ -1449,6 +1488,12 @@ static void stop_session(int goodbye) {
     if (goodbye >= 0 && SDL_AtomicGet(&g_connected)) {
         uint8_t reason = (uint8_t)goodbye;
         send_msg(MSG_GOODBYE, 0, &reason, 1);
+        // Half-close and let the device read the goodbye before we stop reading: closing with
+        // video still inbound can reset the connection and lose it (displays would linger).
+        SDL_LockMutex(g_send_lock);
+        if (g_sock != INVALID_SOCKET) shutdown(g_sock, SD_SEND);
+        SDL_UnlockMutex(g_send_lock);
+        for (int t = 0; t < 500 && SDL_AtomicGet(&g_connected); t += 20) SDL_Delay(20);  // host closes → net thread sees EOF
     }
     SDL_AtomicIncRef(&g_session_gen);  // events from the old session are ignored
     SDL_AtomicSet(&g_net_stop, 1);
@@ -1646,14 +1691,15 @@ static void merge_discovery(void) {
         Device *d = &g_cfg.devices[i];
         g_devrt[i].last_seen = SDL_GetTicks();
         if (strcmp(d->addr, found[f].addr) || d->port != found[f].port) {
-            LOG("device: %s moved %s -> %s", d->name, d->addr, found[f].addr);
-            snprintf(d->addr, sizeof d->addr, "%s", found[f].addr);
-            d->port = found[f].port;
-            changed = 1;
-            if (i == g_cfg.active) {  // the net thread picks it up on its next attempt
+            // Only a hint (anyone can answer discovery): tried, and saved once proven.
+            if (strcmp(g_devrt[i].hint_addr, found[f].addr))
+                LOG("device: %s may have moved %s -> %s; will try it", d->name, d->addr, found[f].addr);
+            snprintf(g_devrt[i].hint_addr, sizeof g_devrt[i].hint_addr, "%s", found[f].addr);
+            g_devrt[i].hint_port = found[f].port;
+            if (i == g_cfg.active) {  // the net thread tries it on its next attempts
                 SDL_LockMutex(g_shared_lock);
-                snprintf(g_session_dev.addr, sizeof g_session_dev.addr, "%s", d->addr);
-                g_session_dev.port = d->port;
+                snprintf(g_hint_addr, sizeof g_hint_addr, "%s", found[f].addr);
+                g_hint_port = found[f].port;
                 SDL_UnlockMutex(g_shared_lock);
             }
         }
@@ -1883,7 +1929,10 @@ static void handle_net_event(NetEvent *e) {
         d->has_key = 1;
         d->paired = 1;
         d->platform = g_last_host.platform;
-        if (!strcmp(d->name, d->addr) && g_last_host.text[0]) snprintf(d->name, sizeof d->name, "%s", g_last_host.text);
+        if (!strcmp(d->name, d->addr) && g_last_host.text[0]) {
+            snprintf(d->name, sizeof d->name, "%s", g_last_host.text);
+            sanitize_name(d->name);
+        }
         SDL_LockMutex(g_shared_lock);
         memcpy(g_session_dev.pub, d->pub, 32);
         g_session_dev.has_key = 1;
@@ -1923,6 +1972,25 @@ static void handle_net_event(NetEvent *e) {
             set_dev_state(i, DEV_CONNECTING, "");
         }
         break;
+    case NE_ADDR_PROVEN:
+        LOG("device: %s is now at %s", d->name, e->text);
+        snprintf(d->addr, sizeof d->addr, "%s", e->text);
+        d->port = e->arg;
+        g_devrt[i].hint_addr[0] = 0;
+        SDL_LockMutex(g_shared_lock);
+        snprintf(g_session_dev.addr, sizeof g_session_dev.addr, "%s", d->addr);
+        g_session_dev.port = d->port;
+        g_hint_addr[0] = 0;
+        SDL_UnlockMutex(g_shared_lock);
+        save_config();
+        break;
+    case NE_HINT_BAD:
+        LOG("device: the discovered address for %s wasn't it; ignoring it", d->name);
+        g_devrt[i].hint_addr[0] = 0;
+        SDL_LockMutex(g_shared_lock);
+        g_hint_addr[0] = 0;
+        SDL_UnlockMutex(g_shared_lock);
+        break;
     case NE_VERSION:
         snprintf(msg, sizeof msg, "needs an update (device runs SoftKVM %s, this PC %s)", e->version, SOFTKVM_VERSION);
         set_dev_state(i, DEV_ERROR, msg);
@@ -1951,6 +2019,13 @@ static void handle_net_event(NetEvent *e) {
 int main(int argc, char **argv) {
     char logpath[MAX_PATH];
     snprintf(logpath, sizeof logpath, "%ssoftkvm.log", exe_dir());
+    // Rotate at 5 MB so the log doesn't grow forever (one previous file kept).
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExA(logpath, GetFileExInfoStandard, &fa) && (fa.nFileSizeHigh || fa.nFileSizeLow > 5u << 20)) {
+        char old[MAX_PATH];
+        snprintf(old, sizeof old, "%s.1", logpath);
+        MoveFileExA(logpath, old, MOVEFILE_REPLACE_EXISTING);
+    }
     g_logfile = fopen(logpath, "a");
 
     // One instance per user: a second launch just exits (benchmarks run next to the real one).

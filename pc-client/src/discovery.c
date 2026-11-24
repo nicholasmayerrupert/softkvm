@@ -89,6 +89,9 @@ int discovery_run(AppHost *out, int max, int timeout_ms) {
         if (name_len > len - rl - 38) name_len = len - rl - 38;
         if (name_len > (int)sizeof h.name - 1) name_len = sizeof h.name - 1;
         memcpy(h.name, p + 38, name_len);
+        for (char *c = h.name; *c; c++)  // unauthenticated input: no control characters
+            if ((unsigned char)*c < 0x20 || *c == 0x7f) *c = ' ';
+        if (strlen(h.name) > 40) h.name[40] = 0;
         inet_ntop(AF_INET, &from.sin_addr, h.addr, sizeof h.addr);
         int dup = 0;
         for (int i = 0; i < n; i++) dup |= !memcmp(out[i].pub, h.pub, 32);

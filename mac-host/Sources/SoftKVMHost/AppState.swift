@@ -18,6 +18,7 @@ final class AppState {
     var clientName: String?      // nil while no PC is connected
     var clientAddress: String?
     var monitors: [PCMonitor] = []
+    var listenerError: String?  // e.g. the port is taken by another copy
     var onChange: (() -> Void)?
 
     static let videoQualities: [(name: String, mbps: Int)] = [

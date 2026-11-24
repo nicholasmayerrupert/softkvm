@@ -101,16 +101,18 @@ void config_save(const Config *c) {
     app_file(L"config.ini.tmp", tmp, MAX_PATH);
     FILE *f = _wfopen(tmp, L"w");
     if (!f) return;
-    fprintf(f, "version=2\npc_style_modifiers=%d\nactive=%d\n", c->pc_style_modifiers, c->active);
+    int ok = fprintf(f, "version=3\npc_style_modifiers=%d\nactive=%d\n", c->pc_style_modifiers, c->active) > 0;
     for (int i = 0; i < c->ndevices; i++) {
         const Device *d = &c->devices[i];
         char pub[65] = "";
         if (d->has_key) hex_encode(d->pub, 32, pub);
-        fprintf(f, "\n[device]\nname=%s\naddr=%s\nport=%d\nplatform=%d\npub=%s\npaired=%d\nmonitors=%s\n", d->name,
-                d->addr, d->port, d->platform, pub, d->paired, d->monitors);
+        ok &= fprintf(f, "\n[device]\nname=%s\naddr=%s\nport=%d\nplatform=%d\npub=%s\npaired=%d\nmonitors=%s\n",
+                      d->name, d->addr, d->port, d->platform, pub, d->paired, d->monitors) > 0;
     }
-    fclose(f);
-    MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING);  // atomic-ish: never leave a half-written file
+    ok &= fclose(f) == 0;
+    // Only replace the real file with a complete one (disk full, etc. keep the old settings).
+    if (ok) MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    else DeleteFileW(tmp);
 }
 
 const char *exe_dir(void) {
@@ -142,14 +144,22 @@ void identity_load(uint8_t priv[32]) {
             LocalFree(out.pbData);
             return;
         }
+        // Unreadable (corrupt, or another Windows user's): keep it aside, never overwrite it.
+        wchar_t aside[MAX_PATH];
+        _snwprintf(aside, MAX_PATH, L"%ls.bad-%lu", path, (unsigned long)GetTickCount());
+        MoveFileExW(path, aside, MOVEFILE_REPLACE_EXISTING);
     }
     sk_random(priv, 32);
     DATA_BLOB in = {32, priv}, out = {0};
     if (CryptProtectData(&in, L"SoftKVM identity", NULL, NULL, NULL, 0, &out)) {
-        f = _wfopen(path, L"wb");
+        wchar_t tmp[MAX_PATH];
+        _snwprintf(tmp, MAX_PATH, L"%ls.tmp", path);
+        f = _wfopen(tmp, L"wb");
         if (f) {
-            fwrite(out.pbData, 1, out.cbData, f);
-            fclose(f);
+            int ok = fwrite(out.pbData, 1, out.cbData, f) == out.cbData;
+            ok &= fclose(f) == 0;
+            if (ok) MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+            else DeleteFileW(tmp);
         }
         LocalFree(out.pbData);
     }

@@ -36,7 +36,12 @@ final class Server: @unchecked Sendable {
         let params = NWParameters(tls: nil, tcp: tcp)
         params.allowLocalEndpointReuse = true
         let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: HostEnv.port)!)
-        listener.stateUpdateHandler = { state in Log.info("server: listener \(state)") }
+        listener.stateUpdateHandler = { state in
+            Log.info("server: listener \(state)")
+            if case .failed(let error) = state {
+                AppState.update { $0.listenerError = "Can't accept PCs: \(error.localizedDescription)" }
+            }
+        }
         listener.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
         listener.start(queue: queue)
         self.listener = listener
@@ -96,13 +101,15 @@ final class Server: @unchecked Sendable {
     }
 
     /// Forgets a paired PC and disconnects it if it's here.
-    func unpair(key: Data) {
-        TrustStore.shared.remove(key: key)
+    @discardableResult
+    func unpair(key: Data) -> Bool {
+        let saved = TrustStore.shared.remove(key: key)
         queue.async {
             if let a = self.active, a.clientKey == key { a.sayGoodbye(.unpaired, "") }
             for s in self.waiting where s.clientKey == key { s.sayGoodbye(.unpaired, "") }
             AppState.update { _ in }
         }
+        return saved
     }
 
     // MARK: - Session lifecycle (server queue)

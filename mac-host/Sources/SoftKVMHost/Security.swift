@@ -17,14 +17,39 @@ enum Identity {
 
     private static func load() -> Curve25519.KeyAgreement.PrivateKey {
         let url = dir.appendingPathComponent("identity.key")
-        if let raw = try? Data(contentsOf: url), let key = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: raw) {
-            return key
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let raw = try? Data(contentsOf: url),
+               let key = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: raw) {
+                return key
+            }
+            // Unreadable: keep it aside (never silently overwrite an identity), then start fresh.
+            let aside = setAside(url)
+            Log.info("security: identity.key was unreadable; kept it as \(aside) and created a new identity "
+                     + "(paired PCs will need to pair again)")
         }
         let key = Curve25519.KeyAgreement.PrivateKey()
-        FileManager.default.createFile(atPath: url.path, contents: key.rawRepresentation,
-                                       attributes: [.posixPermissions: 0o600])
-        Log.info("security: created a new device identity")
+        if !writeAtomically(key.rawRepresentation, to: url) {
+            Log.info("security: couldn't save the new identity; it will change on next launch")
+        } else {
+            Log.info("security: created a new device identity")
+        }
         return key
+    }
+
+    /// Moves a damaged file out of the way, keeping it for inspection. Returns its new name.
+    static func setAside(_ url: URL) -> String {
+        let stamp = Int(Date().timeIntervalSince1970)
+        let aside = url.deletingLastPathComponent().appendingPathComponent("\(url.lastPathComponent).bad-\(stamp)")
+        try? FileManager.default.moveItem(at: url, to: aside)
+        return aside.lastPathComponent
+    }
+
+    /// Writes via a temp file + rename (never a half-written file), owner-only permissions.
+    static func writeAtomically(_ data: Data, to url: URL) -> Bool {
+        let tmp = url.appendingPathExtension("tmp")
+        guard FileManager.default.createFile(atPath: tmp.path, contents: data, attributes: [.posixPermissions: 0o600])
+        else { return false }
+        return rename(tmp.path, url.path) == 0
     }
 }
 
@@ -48,32 +73,44 @@ final class TrustStore {
     private let url = Identity.dir.appendingPathComponent("trusted-pcs.json")
 
     private init() {
-        entries = (try? JSONDecoder().decode([Entry].self, from: Data(contentsOf: url))) ?? []
+        entries = []
+        if FileManager.default.fileExists(atPath: url.path) {
+            if let data = try? Data(contentsOf: url), let list = try? JSONDecoder().decode([Entry].self, from: data) {
+                entries = list
+            } else {
+                // Don't overwrite a list we couldn't read on the next save; keep it for recovery.
+                let aside = Identity.setAside(url)
+                Log.info("security: trusted-pcs.json was unreadable; kept it as \(aside). PCs will need to pair again.")
+            }
+        }
     }
 
     var all: [Entry] { lock.lock(); defer { lock.unlock() }; return entries }
 
     func isTrusted(_ key: Data) -> Bool { all.contains { $0.publicKey == key } }
 
-    func add(name: String, key: Data) {
-        lock.lock()
+    @discardableResult
+    func add(name: String, key: Data) -> Bool {
+        lock.lock(); defer { lock.unlock() }
         entries.removeAll { $0.publicKey == key }
         entries.append(Entry(name: name, publicKey: key, added: Date()))
-        save()
-        lock.unlock()
+        return save()
     }
 
-    func remove(key: Data) {
-        lock.lock()
+    /// Returns false if the change couldn't be saved (it would come back after a restart).
+    @discardableResult
+    func remove(key: Data) -> Bool {
+        lock.lock(); defer { lock.unlock() }
         entries.removeAll { $0.publicKey == key }
-        save()
-        lock.unlock()
+        return save()
     }
 
-    private func save() {
-        if let data = try? JSONEncoder().encode(entries) {
-            FileManager.default.createFile(atPath: url.path, contents: data, attributes: [.posixPermissions: 0o600])
+    private func save() -> Bool {
+        guard let data = try? JSONEncoder().encode(entries), Identity.writeAtomically(data, to: url) else {
+            Log.info("security: couldn't save trusted-pcs.json")
+            return false
         }
+        return true
     }
 }
 
