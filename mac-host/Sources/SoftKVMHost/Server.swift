@@ -44,6 +44,7 @@ final class ClientSession: @unchecked Sendable {
     private var pipelines: [DisplayPipeline] = []
     private let injector = InputInjector()
     private var closed = false
+    private var heartbeat: DispatchSourceTimer?
     var onClose: (() -> Void)?
 
     // Backpressure: bytes handed to the socket but not yet sent.
@@ -75,6 +76,13 @@ final class ClientSession: @unchecked Sendable {
         }
         conn.start(queue: queue)
         readHeader()
+
+        // Heartbeat so the client can detect a dead link even when the screen is idle.
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in self?.send(Proto.message(.ping)) }
+        timer.resume()
+        heartbeat = timer
     }
 
     func close(reason: String) {
@@ -82,6 +90,8 @@ final class ClientSession: @unchecked Sendable {
         closed = true
         Log.info("session: closed (\(reason))")
         injector.releaseAll()
+        heartbeat?.cancel()
+        heartbeat = nil
         conn.cancel()
         let ps = pipelines
         pipelines = []

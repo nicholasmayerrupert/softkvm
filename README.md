@@ -44,6 +44,7 @@ Host → client
 | `0x01` | HELLO_ACK | `u32 version` |
 | `0x02` | STREAM_INFO | `u32 width, u32 height, u32 fps, u32 codec` (1 = HEVC, 2 = H.264) |
 | `0x03` | VIDEO | `u64 pts_us, u8 flags` (bit 0 = keyframe), then Annex B bitstream |
+| `0x05` | PING | (empty) sent every second; clients reconnect after ~4 s of silence |
 | `0x04` | AUDIO | `u64 pts_us`, then s16le stereo PCM @ 48 kHz (system audio) |
 
 Client → host

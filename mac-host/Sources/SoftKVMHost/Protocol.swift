@@ -15,6 +15,7 @@ enum Proto {
         case streamInfo = 0x02
         case video = 0x03
         case audio = 0x04
+        case ping = 0x05
         // client -> host
         case hello = 0x81
         case keyframeRequest = 0x82

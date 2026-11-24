@@ -39,6 +39,7 @@ enum {
     MSG_STREAM_INFO = 0x02,
     MSG_VIDEO = 0x03,
     MSG_AUDIO = 0x04,
+    MSG_PING = 0x05,
     MSG_HELLO = 0x81,
     MSG_KEYFRAME_REQUEST = 0x82,
     MSG_INPUT = 0x90,
@@ -186,6 +187,12 @@ static SOCKET connect_host(void) {
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
         int rcvbuf = 8 * 1024 * 1024;
         setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof rcvbuf);
+        // The host pings every second; silence this long means the link is dead
+        // (e.g. a Wi-Fi drop swallowed the close) and we should reconnect.
+        DWORD timeout_ms = 4000;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof timeout_ms);
+        DWORD send_timeout_ms = 2000;
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&send_timeout_ms, sizeof send_timeout_ms);
     }
     return s;
 }
