@@ -25,6 +25,7 @@ let package = Package(
                 .linkedFramework("CoreMedia"),
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("Network"),
+                .linkedFramework("ServiceManagement"),
             ]
         ),
     ]

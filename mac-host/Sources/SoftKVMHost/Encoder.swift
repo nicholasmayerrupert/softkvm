@@ -63,6 +63,11 @@ final class VideoEncoder {
         return d as CFDictionary
     }
 
+    func setBitrate(_ bitrate: Int) {
+        guard let session else { return }
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+    }
+
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKeyframe: Bool) {
         guard let session else { return }
         let props: CFDictionary? = forceKeyframe

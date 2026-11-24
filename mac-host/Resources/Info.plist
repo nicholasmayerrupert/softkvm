@@ -18,6 +18,8 @@
     <string>14.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>SoftKVM lets your PC find and connect to this Mac on your local network.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>SoftKVM streams your Mac's virtual displays to your PC.</string>
 </dict>

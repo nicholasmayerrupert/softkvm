@@ -3,20 +3,14 @@ import ScreenCaptureKit
 
 /// Menu-bar-only app: listens for a SoftKVM client and streams virtual displays to it.
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var statusItem: NSStatusItem?
+    private var statusMenu: StatusMenu?
     private var server: Server?
+    private var discovery: DiscoveryResponder?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let bitrateMbps = Int(ProcessInfo.processInfo.environment["SOFTKVM_BITRATE_MBPS"] ?? "") ?? 40
-
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "KVM"
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "SoftKVM host — port \(Proto.port)", action: nil, keyEquivalent: ""))
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-        item.menu = menu
-        statusItem = item
+        let bitrateMbps = Int(ProcessInfo.processInfo.environment["SOFTKVM_BITRATE_MBPS"] ?? "")
+            ?? AppState.shared.bitrateMbps
+        let hostName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
 
         Log.info("SoftKVM host starting (bitrate \(bitrateMbps) Mbps)")
 
@@ -33,7 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Accessibility lets us inject the client's keyboard and mouse. Prompts on first run.
         Log.info("accessibility permission: \(InputInjector.checkPermission(prompt: true) ? "OK" : "missing")")
 
-        let server = Server(bitrate: bitrateMbps * 1_000_000)
+        let server = Server(bitrate: bitrateMbps * 1_000_000, hostName: hostName)
         do {
             try server.start()
         } catch {
@@ -41,6 +35,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
         }
         self.server = server
+        statusMenu = StatusMenu(server: server)
+        let discovery = DiscoveryResponder(name: { hostName })
+        discovery.start()
+        self.discovery = discovery
     }
 }
 

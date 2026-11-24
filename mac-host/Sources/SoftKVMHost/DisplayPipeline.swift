@@ -18,7 +18,7 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
     private let sink: Sink
     private let audioSink: AudioSink?
     private let audioQueue: DispatchQueue
-    private let bitrate: Int
+    private var bitrate: Int
 
     private var virtualDisplay: AnyObject?
     private(set) var displayID: CGDirectDisplayID = 0
@@ -133,6 +133,13 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         DispatchQueue.main.async { [virtualDisplay] in _ = virtualDisplay }
         virtualDisplay = nil
         Log.info("display \(index): stopped")
+    }
+
+    func setBitrate(_ bitrate: Int) {
+        queue.async {
+            self.bitrate = bitrate
+            self.encoder?.setBitrate(bitrate)
+        }
     }
 
     func requestKeyframe() {
