@@ -38,13 +38,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         server.askPairing = { name, code, reply in PairingPrompt.ask(name: name, code: code, reply: reply) }
         self.server = server
-        if !Proto.headless {
+        if !Proto.headless && !HostEnv.perf {
             statusMenu = StatusMenu(server: server)
             let discovery = DiscoveryResponder(name: { hostName })
             discovery.start()
             self.discovery = discovery
         } else {
-            Log.info("headless test instance on port \(Proto.port)")
+            Log.info("test instance on port \(Proto.port): no menu, not discoverable")
         }
     }
 }

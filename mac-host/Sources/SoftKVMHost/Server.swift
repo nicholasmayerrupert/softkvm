@@ -35,7 +35,7 @@ final class Server: @unchecked Sendable {
         tcp.noDelay = true
         let params = NWParameters(tls: nil, tcp: tcp)
         params.allowLocalEndpointReuse = true
-        let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Proto.port)!)
+        let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: HostEnv.port)!)
         listener.stateUpdateHandler = { state in Log.info("server: listener \(state)") }
         listener.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
         listener.start(queue: queue)
@@ -389,6 +389,7 @@ final class ClientSession: @unchecked Sendable {
         }
         // Everything else needs an approved, in-control session.
         guard state == .authorized || state == .streaming else { return }
+        if let reply = TimingProto.handle(type: type, payload: payload) { return send(reply) }
         switch msg {
         case .hello:
             handleHello(payload)
@@ -398,7 +399,7 @@ final class ClientSession: @unchecked Sendable {
                 pipelines[Int(stream)].requestKeyframe()
             }
         case .input:
-            injector.handle(payload)
+            if !HostEnv.perf { injector.handle(payload) }
         case .monitors:
             handleMonitors(payload)
         default:
@@ -454,6 +455,18 @@ final class ClientSession: @unchecked Sendable {
         heartbeat?.cancel()
         heartbeat = nil
         conn.cancel()
+        if HostEnv.perf {
+            // Close the test windows before their displays go away, so macOS never moves
+            // them onto a real screen.
+            let ps = pipelines
+            pipelines = []
+            DispatchQueue.main.async {
+                PerfDisplays.stopAnimating()
+                DispatchQueue.global().async { ps.forEach { $0.stop() } }
+            }
+            server?.sessionClosed(self, displays: [], keepDisplays: false)
+            return
+        }
         let handles = pipelines.compactMap { $0.stop(keepDisplay: keepDisplays) }
         pipelines = []
         server?.sessionClosed(self, displays: handles, keepDisplays: keepDisplays)
@@ -464,7 +477,7 @@ final class ClientSession: @unchecked Sendable {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in
-            self?.send(Proto.message(.ping))
+            self?.send(Proto.message(.ping, payload: TimingProto.pingPayload()))
             self?.sendLayoutIfChanged()
         }
         timer.resume()
@@ -511,8 +524,8 @@ final class ClientSession: @unchecked Sendable {
         for (i, r) in requests.enumerated() {
             let pipeline = DisplayPipeline(
                 index: i, request: r, bitrate: server.bitrate,
-                sink: { [weak self] data, key, pts in
-                    self?.sendVideo(stream: i, data: data, keyframe: key, pts: pts)
+                sink: { [weak self] data, key, pts, timing in
+                    self?.sendVideo(stream: i, data: data, keyframe: key, pts: pts, timing: timing)
                 },
                 audioSink: i == 0 ? { [weak self] pcm, pts in self?.sendAudio(pcm: pcm, pts: pts) } : nil,
                 reuse: reuse?[i])
@@ -536,8 +549,10 @@ final class ClientSession: @unchecked Sendable {
                     return
                 }
             }
-            // Kept displays are already where the user left them.
-            if !reused {
+            if HostEnv.perf {
+                PerfDisplays.tuckAway(ps.map(\.displayID))
+                if HostEnv.animate { await PerfDisplays.animate(ps.map(\.displayID)) }
+            } else if !reused {  // kept displays are already where the user left them
                 DisplayLayout.mirrorClientArrangement(displays: ps.map(\.displayID), clientOrigins: clientOrigins)
             }
             self.queue.async { self.streamsReady = true; self.startCursor() }
@@ -627,6 +642,7 @@ final class ClientSession: @unchecked Sendable {
                 self.pendingLock.unlock()
                 if let error { self.queue.async { self.close(reason: "send error \(error)", keepDisplays: true) } }
                 if !recover.isEmpty {
+                    Log.info("session: backlog drained, requesting keyframes for \(recover)")
                     self.queue.async {
                         for s in recover where s < self.pipelines.count { self.pipelines[s].requestKeyframe() }
                     }
@@ -647,7 +663,7 @@ final class ClientSession: @unchecked Sendable {
         send(Proto.message(.audio, payload: payload))
     }
 
-    private func sendVideo(stream: Int, data: Data, keyframe: Bool, pts: UInt64) {
+    private func sendVideo(stream: Int, data: Data, keyframe: Bool, pts: UInt64, timing: FrameTiming) {
         pendingLock.lock()
         let pending = pendingBytes
         var drop = false
@@ -656,18 +672,24 @@ final class ClientSession: @unchecked Sendable {
             if drop {
                 dropping.insert(stream)
                 keyframeRequested.remove(stream)  // ask again once drained
+                Log.info("session: stream \(stream) keyframe dropped (\(pending / 1024) KB unsent)")
             } else {
+                if dropping.contains(stream) { Log.info("session: stream \(stream) recovered with \(data.count / 1024) KB keyframe") }
                 dropping.remove(stream)
                 keyframeRequested.remove(stream)
             }
         } else {
             // Once a P-frame is dropped, everything until the next keyframe is useless.
             drop = dropping.contains(stream) || pending > Self.softLimit
-            if drop, !dropping.contains(stream) { dropping.insert(stream) }
+            if drop, !dropping.contains(stream) {
+                dropping.insert(stream)
+                Log.info("session: stream \(stream) backlogged (\(pending / 1024) KB unsent), dropping until keyframe")
+            }
         }
         pendingLock.unlock()
         if drop { return }  // a keyframe is requested once the backlog drains (see send)
 
+        send(TimingProto.frameTimingMessage(stream: stream, pts: pts, timing: timing, pendingBytes: pending))
         var payload = Data(capacity: 9 + data.count)
         payload.appendLE(pts)
         payload.append(keyframe ? 1 : 0)

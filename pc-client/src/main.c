@@ -31,6 +31,9 @@
 #include "discovery.h"
 #include "keymap.h"
 #include "secure.h"
+#include "perf.h"
+#include "d3d_present.h"
+#include <SDL_syswm.h>  // HWND for the D3D11 presenter
 #include "tray.h"
 
 #include <shellapi.h>
@@ -94,6 +97,8 @@ typedef struct {
     int cursor_tex_version;
     int dirty;  // needs a redraw (e.g. the local cursor moved)
     Uint32 last_present;
+    D3DPWindow *d3d;  // zero-copy presenter (NULL: SDL renderer)
+    AVFrame *cur;     // frame on screen (d3d path; keeps the decoder surface alive)
 
     // stats
     int frames, decoded_bytes;
@@ -104,6 +109,9 @@ static Stream g_streams[MAX_STREAMS];
 static int g_nstreams;
 static Config g_cfg;          // main thread only
 static int g_force_sw;
+static int g_sdl_render;  // --sdl-render: old copy-based SDL renderer path
+static int g_decode_sync; // --decode-sync: wait for each decode to finish on the GPU (experiment)
+static int g_present_mode = D3DP_PRESENT_FLIP;
 static int g_cli_monitors;    // --monitor given: don't use the saved monitor selection
 static SDL_Thread *g_net_thread;
 static SDL_atomic_t g_net_stop;
@@ -223,6 +231,7 @@ static void logf_(const char *fmt, ...) {
 static void put_u16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
 static void put_u32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = v >> (8 * i); }
 static uint32_t get_u32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+static uint64_t get_u64(const uint8_t *p) { return get_u32(p) | (uint64_t)get_u32(p + 4) << 32; }
 
 static int send_all(SOCKET s, const uint8_t *buf, int len) {
     while (len > 0) {
@@ -342,7 +351,7 @@ static int stream_open_decoder(Stream *s, int codec) {
     c->flags |= AV_CODEC_FLAG_LOW_DELAY;
     if (g_hw_device) {
         c->hw_device_ctx = av_buffer_ref(g_hw_device);
-        c->get_format = pick_hw_format;
+        c->get_format = d3dp_active() ? d3dp_get_format : pick_hw_format;
         c->thread_count = 1;
     } else {
         c->thread_count = 4;
@@ -366,6 +375,7 @@ static void request_keyframe(int idx) {
 
 static void handoff(Stream *s, AVFrame *f) {
     SDL_LockMutex(s->lock);
+    if (s->has_new) perf_dropped((int)(s - g_streams), (uint64_t)s->ready->pts);
     av_frame_unref(s->ready);
     av_frame_move_ref(s->ready, f);
     int notify = !s->has_new;
@@ -387,6 +397,7 @@ static void decode_video(int idx, uint8_t *payload, uint32_t len) {
 
     s->pkt->data = payload + 9;
     s->pkt->size = (int)len - 9;
+    s->pkt->pts = (int64_t)get_u64(payload);
     if (keyframe) s->pkt->flags |= AV_PKT_FLAG_KEY; else s->pkt->flags &= ~AV_PKT_FLAG_KEY;
     int ret = avcodec_send_packet(s->dec, s->pkt);
     if (ret < 0) {
@@ -397,7 +408,10 @@ static void decode_video(int idx, uint8_t *payload, uint32_t len) {
     }
     while ((ret = avcodec_receive_frame(s->dec, s->frame)) == 0) {
         AVFrame *out = s->frame;
-        if (s->frame->format == AV_PIX_FMT_D3D11) {
+        int64_t pts = s->frame->pts;
+        if (g_decode_sync && d3dp_active() && s->frame->format == AV_PIX_FMT_D3D11) d3dp_gpu_wait();
+        perf_mark(idx, (uint64_t)pts, ST_DECODED, perf_now_us());
+        if (s->frame->format == AV_PIX_FMT_D3D11 && !d3dp_active()) {
             av_frame_unref(s->sw);
             if (av_hwframe_transfer_data(s->sw, s->frame, 0) < 0) {
                 LOG("decoder: hw transfer failed");
@@ -406,6 +420,8 @@ static void decode_video(int idx, uint8_t *payload, uint32_t len) {
             }
             av_frame_unref(s->frame);
             out = s->sw;
+            out->pts = pts;
+            perf_mark(idx, (uint64_t)pts, ST_XFER, perf_now_us());
         }
         handoff(s, out);
         s->frames++;
@@ -415,6 +431,7 @@ static void decode_video(int idx, uint8_t *payload, uint32_t len) {
     if (now - s->stats_start >= 5000) {
         double secs = (now - s->stats_start) / 1000.0;
         LOG("stream %d: %.1f fps, %.1f Mbps", idx, s->frames / secs, s->decoded_bytes * 8 / secs / 1e6);
+        perf_log_stats(idx, logf_);
         s->frames = 0;
         s->decoded_bytes = 0;
         s->stats_start = now;
@@ -661,6 +678,7 @@ static int net_thread(void *unused) {
         for (;;) {
             uint8_t hdr[4];
             if (recv_all(s, hdr, 4) < 0) break;
+            int64_t hdr_us = perf_now_us();
             uint32_t rl = get_u32(hdr);
             if (rl < SK_TAG + 8 || rl > MAX_PAYLOAD + 8 + SK_TAG) {
                 LOG("net: bad record length (%u)", rl);
@@ -679,6 +697,7 @@ static int net_thread(void *unused) {
             uint8_t type = buf[0], stream = buf[1];
             uint32_t len = get_u32(buf + 4);
             if (len > (uint32_t)pl - 8) break;
+            int64_t done_us = perf_now_us();
             uint8_t *msg = buf + 8;  // decoders read past the end: keep the padding zeroed
             memset(msg + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);  // fits: cap >= rl + padding
 
@@ -694,6 +713,7 @@ static int net_thread(void *unused) {
                 case AUTH_OK:
                     authorized = 1;
                     LOG("net: authorized");
+                    perf_connected();
                     if (send_hello() < 0 || send_monitors() < 0) goto disconnected;
                     break;
                 case AUTH_PAIRED:
@@ -731,6 +751,7 @@ static int net_thread(void *unused) {
                 goto disconnected;
             }
             if (!authorized) continue;
+            if (perf_handle_msg(type, stream, msg, len, done_us)) continue;  // latency instrumentation
 
             switch (type) {
             case MSG_HELLO_ACK:
@@ -745,7 +766,12 @@ static int net_thread(void *unused) {
                 }
                 break;
             case MSG_VIDEO:
+                if (stream < g_nstreams && len >= 9)
+                    perf_on_video(stream, get_u64(msg), len, msg[8] & 1, hdr_us, done_us);
                 if (stream < g_nstreams) decode_video(stream, msg, len);
+                break;
+            case MSG_PING:
+                perf_on_ping(msg, len);
                 break;
             case MSG_AUDIO:
                 play_audio(msg, len);
@@ -779,6 +805,7 @@ static int net_thread(void *unused) {
         }
     disconnected:
         LOG("net: disconnected");
+        perf_disconnected();
         SDL_AtomicSet(&g_connected, 0);
         post_net(gen, NE_DISCONNECTED, 0, NULL, NULL);
         SDL_LockMutex(g_send_lock);
@@ -822,12 +849,26 @@ static int cursor_stream(void) {
     return d >= 0 ? g_layout[d].stream : -1;
 }
 
-/// Draws the Mac cursor locally so it moves with zero video latency.
-static void draw_cursor(Stream *s) {
-    if (!g_mac_mode || !g_cursor_valid || !g_cursor_px) return;
+/// Where the local cursor goes in a window of ow x oh pixels; 0 if it isn't on this stream.
+static int cursor_dst(Stream *s, int ow, int oh, SDL_Rect *r) {
+    if (!g_mac_mode || !g_cursor_valid || !g_cursor_px) return 0;
     int idx = (int)(s - g_streams);
     const MacDisplay *d = layout_for_stream(idx);
-    if (!d || cursor_stream() != idx) return;
+    if (!d || cursor_stream() != idx) return 0;
+    double sx = ow / d->w, sy = oh / d->h;
+    r->x = (int)((g_cx - d->x - g_cursor_hx) * sx);
+    r->y = (int)((g_cy - d->y - g_cursor_hy) * sy);
+    r->w = (int)(g_cursor_w * sx + 0.5);
+    r->h = (int)(g_cursor_h * sy + 0.5);
+    return 1;
+}
+
+/// Draws the Mac cursor locally so it moves with zero video latency.
+static void draw_cursor(Stream *s) {
+    int ow, oh;
+    SDL_Rect r;
+    SDL_GetRendererOutputSize(s->ren, &ow, &oh);
+    if (!cursor_dst(s, ow, oh, &r)) return;
     if (s->cursor_tex_version != g_cursor_version || !s->cursor_tex) {
         if (s->cursor_tex) SDL_DestroyTexture(s->cursor_tex);
         s->cursor_tex = SDL_CreateTexture(s->ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC,
@@ -837,11 +878,6 @@ static void draw_cursor(Stream *s) {
         SDL_SetTextureBlendMode(s->cursor_tex, SDL_BLENDMODE_BLEND);
         s->cursor_tex_version = g_cursor_version;
     }
-    int ow, oh;
-    SDL_GetRendererOutputSize(s->ren, &ow, &oh);
-    double sx = ow / d->w, sy = oh / d->h;
-    SDL_Rect r = {(int)((g_cx - d->x - g_cursor_hx) * sx), (int)((g_cy - d->y - g_cursor_hy) * sy),
-                  (int)(g_cursor_w * sx + 0.5), (int)(g_cursor_h * sy + 0.5)};
     SDL_RenderCopy(s->ren, s->cursor_tex, NULL, &r);
 }
 
@@ -850,13 +886,73 @@ static void mark_cursor_dirty(void) {
     if (i >= 0) g_streams[i].dirty = 1;
 }
 
+/// Zero-copy path: draws the decoder's D3D11 surface directly. If the swap chain still has a
+/// frame queued, leaves the new one pending (newest wins) and retries on the next loop pass.
+static void render_stream_d3d(Stream *s) {
+    if (!d3dp_ready(s->d3d)) {
+        s->dirty = 1;
+        return;
+    }
+    int idx = (int)(s - g_streams);
+    SDL_LockMutex(s->lock);
+    int fresh = s->has_new;
+    if (fresh) {
+        av_frame_unref(s->cur);
+        av_frame_move_ref(s->cur, s->ready);
+    }
+    s->has_new = 0;
+    SDL_UnlockMutex(s->lock);
+    uint64_t pts = (uint64_t)s->cur->pts;
+    if (fresh) perf_mark(idx, pts, ST_FETCH, perf_now_us());
+
+    int ow = 0, oh = 0;
+    SDL_GetWindowSizeInPixels(s->win, &ow, &oh);
+    SDL_Rect r;
+    D3DPCursor c = {0};
+    if (cursor_dst(s, ow, oh, &r)) {
+        c.px = g_cursor_px;
+        c.w = g_cursor_w;
+        c.h = g_cursor_h;
+        c.version = g_cursor_version;
+        c.x = r.x, c.y = r.y, c.dw = r.w, c.dh = r.h;
+    }
+    if (fresh && s->cur->format != AV_PIX_FMT_D3D11) {
+        static int warned;
+        if (!warned++) LOG("render: decoder fell back to software frames; restart with --sdl-render");
+    }
+    d3dp_render(s->d3d, s->cur->buf[0] ? s->cur : NULL, &c);
+    if (fresh) perf_mark(idx, pts, ST_UPLOADED, perf_now_us());
+    static int snap_frames;
+    if (g_perf_snapshot && idx == 0 && fresh && ++snap_frames > 150) {
+        LOG("bench: snapshot %s: %s", g_perf_snapshot, d3dp_snapshot(s->d3d, g_perf_snapshot) == 0 ? "ok" : "failed");
+        g_perf_snapshot = NULL;
+    }
+    d3dp_present(s->d3d);
+    if (fresh) {
+        perf_mark(idx, pts, ST_PRESENTED, perf_now_us());
+        if (g_perf_gpu_wait) {
+            d3dp_gpu_wait();
+            perf_mark(idx, pts, ST_GPU_DONE, perf_now_us());
+        }
+    }
+    s->dirty = 0;
+    s->last_present = SDL_GetTicks();
+}
+
 static void render_stream(Stream *s) {
+    if (s->d3d) {
+        render_stream_d3d(s);
+        return;
+    }
     AVFrame *f = av_frame_alloc();
     SDL_LockMutex(s->lock);
     int fresh = s->has_new;
     if (fresh) av_frame_move_ref(f, s->ready);
     s->has_new = 0;
     SDL_UnlockMutex(s->lock);
+    int idx = (int)(s - g_streams);
+    uint64_t pts = (uint64_t)f->pts;
+    if (fresh) perf_mark(idx, pts, ST_FETCH, perf_now_us());
 
     if (fresh) {
         int fmt = f->format == AV_PIX_FMT_NV12 ? SDL_PIXELFORMAT_NV12
@@ -877,6 +973,7 @@ static void render_stream(Stream *s) {
             else
                 SDL_UpdateYUVTexture(s->tex, NULL, f->data[0], f->linesize[0], f->data[1], f->linesize[1],
                                      f->data[2], f->linesize[2]);
+            perf_mark(idx, pts, ST_UPLOADED, perf_now_us());
         }
     }
     av_frame_free(&f);
@@ -886,6 +983,13 @@ static void render_stream(Stream *s) {
     if (s->tex) SDL_RenderCopy(s->ren, s->tex, NULL, NULL);
     draw_cursor(s);
     SDL_RenderPresent(s->ren);
+    if (fresh) {
+        perf_mark(idx, pts, ST_PRESENTED, perf_now_us());
+        if (g_perf_gpu_wait) {
+            perf_gpu_wait_renderer(s->ren);
+            perf_mark(idx, pts, ST_GPU_DONE, perf_now_us());
+        }
+    }
     s->dirty = 0;
     s->last_present = SDL_GetTicks();
 }
@@ -895,12 +999,35 @@ static int create_window(Stream *s, int idx) {
     SDL_GetDisplayBounds(s->monitor, &b);
     char title[64];
     snprintf(title, sizeof title, "SoftKVM %d", idx + 1);
-    s->win = SDL_CreateWindow(title, b.x, b.y, b.w, b.h, SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALLOW_HIGHDPI);
+    if (g_perf_bench_secs) {
+        // Headless benchmark: a hidden window of the stream's size, never shown or focused.
+        b.x = b.y = 0;
+        b.w = s->w;
+        b.h = s->h;
+    }
+    s->win = SDL_CreateWindow(title, b.x, b.y, b.w, b.h, SDL_WINDOW_BORDERLESS | SDL_WINDOW_ALLOW_HIGHDPI |
+                              (g_perf_bench_secs ? SDL_WINDOW_HIDDEN : 0));
     if (!s->win) {
         LOG("window: %s", SDL_GetError());
         return -1;
     }
-    SDL_SetWindowFullscreen(s->win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    if (!g_perf_bench_secs) SDL_SetWindowFullscreen(s->win, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    if (d3dp_active()) {
+        SDL_SysWMinfo wm;
+        SDL_VERSION(&wm.version);
+        if (SDL_GetWindowWMInfo(s->win, &wm)) s->d3d = d3dp_window_create(wm.info.win.window);
+        if (!s->d3d) {
+            LOG("window %d: D3D11 presenter failed", idx);
+            return -1;
+        }
+        s->cur = av_frame_alloc();
+        LOG("window %d on monitor %d (%dx%d at %d,%d), zero-copy D3D11 presenter", idx, s->monitor, b.w, b.h, b.x,
+            b.y);
+        d3dp_ready(s->d3d);  // every present consumes one frame-latency slot
+        d3dp_render(s->d3d, NULL, NULL);
+        d3dp_present(s->d3d);
+        return 0;
+    }
     s->ren = SDL_CreateRenderer(s->win, -1, SDL_RENDERER_ACCELERATED);
     if (!s->ren) {
         LOG("renderer: %s", SDL_GetError());
@@ -1002,6 +1129,10 @@ static int stream_for_window(Uint32 window_id) {
 }
 
 static void set_mac_mode(int on) {
+    if (g_perf_bench_secs) {  // benchmarks never show windows or grab input
+        g_mac_mode = on;
+        return;
+    }
     g_mac_mode = on;
     if (on) {
         // Bring up every Mac window and focus the one on the monitor the PC cursor is on.
@@ -1119,11 +1250,19 @@ static void usage(void) {
             "usage: softkvm [DEVICE_ADDRESS] [--port P] [--monitor N[:WxH@FPS]]... [--sw-decode]\n"
             "               [--start-hidden] [--mac-modifiers]\n"
             "  Devices, monitors and the keyboard style are normally chosen from the tray icon and saved.\n"
+            "  --present flip|tearing|vsync  how frames reach the screen (default flip: newest frame\n"
+            "                   at the next refresh; tearing: immediately / VRR)\n"
+            "  --sdl-render     old SDL renderer path (copies every frame through the CPU)\n"
             "  Ctrl+Alt+Space switches between this PC and the active device; Ctrl+Alt+1..9 picks a device.\n");
 }
 
 // ---------------------------------------------------------------------------
 // Devices, monitors and sessions (main thread)
+
+/// Saves settings, except in benchmark runs (which use a throwaway device entry).
+static void save_config(void) {
+    if (!g_perf_bench_secs) config_save(&g_cfg);
+}
 
 static Device *active_dev(void) {
     return g_cfg.active >= 0 && g_cfg.active < g_cfg.ndevices ? &g_cfg.devices[g_cfg.active] : NULL;
@@ -1181,7 +1320,7 @@ static void save_monitor_selection(void) {
         strncat(list, g_pcmons[i].name, sizeof list - strlen(list) - 1);
     }
     snprintf(d->monitors, sizeof d->monitors, "%s", list);
-    config_save(&g_cfg);
+    save_config();
 }
 
 static int add_stream(int monitor, int w, int h, int fps) {
@@ -1273,6 +1412,8 @@ static void stop_session(int goodbye) {
         if (s->tex) SDL_DestroyTexture(s->tex);
         if (s->cursor_tex) SDL_DestroyTexture(s->cursor_tex);
         if (s->ren) SDL_DestroyRenderer(s->ren);
+        d3dp_window_destroy(s->d3d);
+        av_frame_free(&s->cur);
         if (s->win) SDL_DestroyWindow(s->win);
         if (s->lock) SDL_DestroyMutex(s->lock);
         memset(s, 0, sizeof *s);
@@ -1296,7 +1437,7 @@ static void switch_to_device(int n) {
     if (g_mac_mode) set_mac_mode(0);
     stop_session(GOODBYE_SWITCHING);
     g_cfg.active = n;
-    config_save(&g_cfg);
+    save_config();
     refresh_pc_monitors();
     SDL_AtomicSet(&g_paused, 0);
     g_want_mac_on_connect = 1;
@@ -1417,7 +1558,7 @@ static int add_device(const AppHost *h) {
     d->has_key = 1;
     memset(&g_devrt[i], 0, sizeof g_devrt[i]);
     g_devrt[i].last_seen = SDL_GetTicks();
-    config_save(&g_cfg);
+    save_config();
     LOG("device: added %s (%s)", d->name, d->addr);
     return i;
 }
@@ -1452,7 +1593,7 @@ static void merge_discovery(void) {
             }
         }
     }
-    if (changed) config_save(&g_cfg);
+    if (changed) save_config();
     // First run: nothing added yet, so start pairing with the first device found.
     if (g_cfg.ndevices == 0) {
         AppHost avail[APP_MAX_HOSTS];
@@ -1556,7 +1697,7 @@ static void handle_command(int cmd, int arg) {
         g_cfg.ndevices--;
         if (was_active) g_cfg.active = g_cfg.ndevices ? 0 : -1;
         else if (arg < g_cfg.active) g_cfg.active--;
-        config_save(&g_cfg);
+        save_config();
         if (was_active) {
             refresh_pc_monitors();
             g_want_mac_on_connect = 0;
@@ -1595,7 +1736,7 @@ static void handle_command(int cmd, int arg) {
     case CMD_SET_MODIFIERS:
         g_pc_style_modifiers = arg != 0;
         g_cfg.pc_style_modifiers = g_pc_style_modifiers;
-        config_save(&g_cfg);
+        save_config();
         if (g_mac_mode) send_release_all();
         break;
     case CMD_TOGGLE_AUTOSTART:
@@ -1669,7 +1810,7 @@ static void handle_net_event(NetEvent *e) {
         memcpy(g_session_dev.pub, d->pub, 32);
         g_session_dev.has_key = 1;
         SDL_UnlockMutex(g_shared_lock);
-        config_save(&g_cfg);
+        save_config();
         if (g_want_mac_on_connect) {
             g_want_mac_on_connect = 0;
             set_mac_mode(1);
@@ -1677,7 +1818,7 @@ static void handle_net_event(NetEvent *e) {
         break;
     case NE_DISCONNECTED:
         if (!SDL_AtomicGet(&g_paused) && g_devrt[i].state != DEV_BUSY) set_dev_state(i, DEV_CONNECTING, "");
-        if (g_mac_mode) {
+        if (g_mac_mode && !g_perf_bench_secs) {
             LOG("mode: lost %s; back to the PC", d->name);
             set_mac_mode(0);
         }
@@ -1722,9 +1863,11 @@ int main(int argc, char **argv) {
     snprintf(logpath, sizeof logpath, "%ssoftkvm.log", exe_dir());
     g_logfile = fopen(logpath, "a");
 
-    // One instance per user: a second launch just exits.
-    CreateMutexW(NULL, TRUE, L"Local\\SoftKVMClient");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    // One instance per user: a second launch just exits (benchmarks run next to the real one).
+    int bench_run = 0;
+    for (int i = 1; i < argc; i++) bench_run |= !strcmp(argv[i], "--bench");
+    if (!bench_run) CreateMutexW(NULL, TRUE, L"Local\\SoftKVMClient");
+    if (!bench_run && GetLastError() == ERROR_ALREADY_EXISTS) {
         LOG("another SoftKVM is already running; exiting");
         return 0;
     }
@@ -1737,7 +1880,9 @@ int main(int argc, char **argv) {
     SDL_SetHint(SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED, "0");
     SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "0");
     SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "1");  // honor Windows pointer speed/acceleration
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
+    for (int i = 1; i + 1 < argc; i++)
+        if (!strcmp(argv[i], "--bench")) g_perf_bench_secs = atoi(argv[i + 1]);
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | (g_perf_bench_secs ? 0 : SDL_INIT_AUDIO)) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
@@ -1760,6 +1905,18 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--sw-decode")) g_force_sw = 1;
         else if (!strcmp(argv[i], "--start-hidden")) g_start_hidden = 1;
         else if (!strcmp(argv[i], "--mac-modifiers")) g_pc_style_modifiers = 0;
+        else if (!strcmp(argv[i], "--bench") && i + 1 < argc) i++;  // parsed above
+        else if (!strcmp(argv[i], "--csv") && i + 1 < argc) g_perf_csv = argv[++i];
+        else if (!strcmp(argv[i], "--sdl-render")) g_sdl_render = 1;
+        else if (!strcmp(argv[i], "--gpu-wait")) g_perf_gpu_wait = 1;
+        else if (!strcmp(argv[i], "--decode-sync")) g_decode_sync = 1;
+        else if (!strcmp(argv[i], "--snapshot") && i + 1 < argc) g_perf_snapshot = argv[++i];
+        else if (!strcmp(argv[i], "--present") && i + 1 < argc) {
+            const char *m = argv[++i];
+            g_present_mode = !strcmp(m, "tearing") ? D3DP_PRESENT_TEARING
+                           : !strcmp(m, "vsync")   ? D3DP_PRESENT_VSYNC
+                                                   : D3DP_PRESENT_FLIP;
+        }
         else if (argv[i][0] != '-') cli_host = argv[i];
         else { usage(); return 1; }
     }
@@ -1777,12 +1934,13 @@ int main(int argc, char **argv) {
         if (found >= 0) {
             if (cli_port) g_cfg.devices[found].port = cli_port;
             g_cfg.active = found;
-            config_save(&g_cfg);
+            save_config();  // a benchmark never touches saved settings (see save_config)
         }
     }
     refresh_pc_monitors();
 
     SDL_AudioSpec want = {0}, have;
+    if (!g_perf_bench_secs) {
     want.freq = AUDIO_RATE;
     want.format = AUDIO_S16LSB;
     want.channels = 2;
@@ -1790,11 +1948,15 @@ int main(int argc, char **argv) {
     g_audio = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
     if (g_audio) LOG("audio: output %d Hz, %d ch, %d-sample buffer", have.freq, have.channels, have.samples);
     else LOG("audio: no output device (%s)", SDL_GetError());
+    }
 
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    if (!g_force_sw && av_hwdevice_ctx_create(&g_hw_device, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0) < 0) {
+    if (!g_force_sw && !g_sdl_render && d3dp_init(&g_hw_device, g_present_mode) == 0) {
+        LOG("decoder: D3D11VA, zero-copy presenter (%s)",
+            g_present_mode == D3DP_PRESENT_TEARING ? "tearing" : g_present_mode == D3DP_PRESENT_VSYNC ? "vsync" : "flip");
+    } else if (!g_force_sw && av_hwdevice_ctx_create(&g_hw_device, AV_HWDEVICE_TYPE_D3D11VA, NULL, NULL, 0) < 0) {
         LOG("decoder: D3D11VA unavailable, using software decoding");
         g_hw_device = NULL;
     }
@@ -1806,16 +1968,25 @@ int main(int argc, char **argv) {
     g_shared_lock = SDL_CreateMutex();
     SDL_StopTextInput();
 
-    if (tray_init() < 0) LOG("tray: could not create the notification icon");
-    LOG(tray_hotkey_registered() ? "hotkey: Ctrl+Alt+Space registered"
-                                 : "hotkey: Ctrl+Alt+Space is taken by another app; it only works in Mac mode");
+    if (!g_perf_bench_secs) {
+        if (tray_init() < 0) LOG("tray: could not create the notification icon");
+        LOG(tray_hotkey_registered() ? "hotkey: Ctrl+Alt+Space registered"
+                                     : "hotkey: Ctrl+Alt+Space is taken by another app; it only works in Mac mode");
+    }
 
     // Start on the PC; switch to the device once connected (unless started hidden).
-    g_mac_mode = 0;
-    g_want_mac_on_connect = !g_start_hidden;
+    // Bench: render into hidden windows, never show them or grab input; no tray, no discovery.
+    g_mac_mode = g_perf_bench_secs ? 1 : 0;
+    g_want_mac_on_connect = !g_start_hidden && !g_perf_bench_secs;
+    perf_init(send_msg);
     start_session();
-    start_discovery();
-    update_tray();
+    if (g_perf_bench_secs) {
+        LOG("bench: headless run for %d s", g_perf_bench_secs);
+    } else {
+        start_discovery();
+        update_tray();
+    }
+    Uint32 bench_end = SDL_GetTicks() + (Uint32)g_perf_bench_secs * 1000;
 
     while (!SDL_AtomicGet(&g_quit)) {
         SDL_Event ev;
@@ -1845,19 +2016,27 @@ int main(int argc, char **argv) {
                     if (i >= 0) render_stream(&g_streams[i]);
                 } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED && g_mac_mode) {
                     SDL_Window *w = SDL_GetWindowFromID(ev.window.windowID);
-                    if (w) SDL_SetWindowKeyboardGrab(w, SDL_TRUE);
-                    if (!SDL_GetRelativeMouseMode()) SDL_SetRelativeMouseMode(SDL_TRUE);
+                    if (w && !g_perf_bench_secs) SDL_SetWindowKeyboardGrab(w, SDL_TRUE);
+                    if (!SDL_GetRelativeMouseMode() && !g_perf_bench_secs) SDL_SetRelativeMouseMode(SDL_TRUE);
                 } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                     check_focus = 1;
                 }
             } else if (ev.type == SDL_DISPLAYEVENT && !g_mac_mode) {
                 refresh_pc_monitors();  // monitor plugged/unplugged: refresh the menu's list
-            } else if (g_mac_mode) {
+            } else if (g_mac_mode && !g_perf_bench_secs) {
                 forward_input(&ev);
             }
         } while (SDL_PollEvent(&ev));
         sync_shared_state();
-        flush_mouse_move();
+        if (g_perf_bench_secs && layout_for_stream(0)) {
+            // Bench: pin the local cursor to the middle of stream 0 so cursor drawing is
+            // exercised (the host reports wherever the Mac's real cursor is).
+            const MacDisplay *d = layout_for_stream(0);
+            g_cx = d->x + d->w / 2;
+            g_cy = d->y + d->h / 2;
+            g_cursor_valid = 1;
+        }
+        if (!g_perf_bench_secs) flush_mouse_move();
 
         // Focus left our windows entirely (e.g. Ctrl+Alt+Del): lift keys held on the device.
         if (check_focus && g_mac_mode && stream_for_window(SDL_GetKeyboardFocus()
@@ -1871,6 +2050,15 @@ int main(int argc, char **argv) {
 
         if (!g_mac_mode) continue;  // keep decoding in the background, draw when shown
         Uint32 now = SDL_GetTicks();
+        if (g_perf_bench_secs && (Sint32)(now - bench_end) >= 0) {
+            perf_log_cpu(logf_);
+            SDL_AtomicSet(&g_quit, 1);
+        }
+        static int cpu_started;
+        if (g_perf_bench_secs && !cpu_started && now + (Uint32)(g_perf_bench_secs - 3) * 1000 >= bench_end) {
+            cpu_started = 1;  // measure CPU after the first 3 s (connect, display setup)
+            perf_log_cpu(NULL);
+        }
         for (int i = 0; i < g_nstreams; i++) {
             Stream *st = &g_streams[i];
             SDL_LockMutex(st->lock);
@@ -1882,9 +2070,10 @@ int main(int argc, char **argv) {
     }
 
     LOG("quitting");
-    if (g_mac_mode) send_release_all();
-    stop_session(GOODBYE_QUIT);
-    tray_shutdown();
+    if (g_mac_mode && !g_perf_bench_secs) send_release_all();
+    stop_session(g_perf_bench_secs ? -1 : GOODBYE_QUIT);
+    perf_finish();
+    if (!g_perf_bench_secs) tray_shutdown();
     SDL_Quit();
     WSACleanup();
     return 0;
