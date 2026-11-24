@@ -17,7 +17,6 @@
 #include <windows.h>
 
 #include <SDL.h>
-#include <SDL_syswm.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 
@@ -27,7 +26,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "app.h"
+#include "config.h"
+#include "discovery.h"
 #include "keymap.h"
+#include "tray.h"
+
+#include <shellapi.h>
 
 #define PROTO_VERSION 0
 #define DEFAULT_PORT 47900
@@ -43,8 +48,10 @@ enum {
     MSG_LAYOUT = 0x06,
     MSG_CURSOR = 0x07,
     MSG_CURSOR_POS = 0x08,
+    MSG_SET_MONITORS = 0x09,
     MSG_HELLO = 0x81,
     MSG_KEYFRAME_REQUEST = 0x82,
+    MSG_MONITORS = 0x83,
     MSG_INPUT = 0x90,
 };
 
@@ -84,9 +91,28 @@ typedef struct {
 
 static Stream g_streams[MAX_STREAMS];
 static int g_nstreams;
-static char g_host[256];
-static int g_port = DEFAULT_PORT;
+static Config g_cfg;          // written on the main thread under g_shared_lock
 static int g_force_sw;
+static int g_cli_monitors;    // --monitor given: don't use the saved monitor selection
+static SDL_Thread *g_net_thread;
+static SDL_atomic_t g_net_stop;
+static SDL_atomic_t g_connected;
+static SDL_atomic_t g_session_gen;
+static char g_net_host_name[128];  // the Mac's name (g_shared_lock)
+static Uint32 g_cmd_event;
+
+// Every PC monitor (main thread).
+typedef struct { char name[64]; int x, y, w, h, hz; int selected; } PCMonitor;
+static PCMonitor g_pcmons[MAX_STREAMS];
+static int g_npcmons;
+
+// LAN discovery results (g_shared_lock).
+static AppHost g_found[APP_MAX_HOSTS];
+static int g_nfound;
+static SDL_atomic_t g_searching;
+static Uint32 g_last_search;
+
+enum { CMD_INTERNAL_STATUS = 90, CMD_INTERNAL_DISCOVERY_DONE = 91 };
 static SDL_atomic_t g_quit;
 static Uint32 g_frame_event;
 static SOCKET g_sock = INVALID_SOCKET;
@@ -106,11 +132,9 @@ static int g_audio_playing;
 // Input / mode switching
 enum { IN_MOUSE_MOVE = 1, IN_MOUSE_BUTTON = 2, IN_SCROLL = 3, IN_KEY = 4, IN_RELEASE_ALL = 5,
        IN_MOUSE_MOVE_GLOBAL = 6 };
-#define HOTKEY_ID_TOGGLE 1
 static int g_mac_mode = 1;
 static int g_start_hidden;
 static int g_pc_style_modifiers = 1;
-static int g_hotkey_registered;
 static Uint32 g_last_toggle;
 static int g_pending_move;
 
@@ -193,18 +217,37 @@ static int send_msg(uint8_t type, uint8_t stream, const uint8_t *payload, uint32
     return r;
 }
 
-static SOCKET connect_host(void) {
+/// connect() with a timeout, so a wrong or sleeping Mac doesn't block for ~20 s.
+static int connect_timeout(SOCKET s, const struct sockaddr *addr, int len, int timeout_ms) {
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+    int r = connect(s, addr, len);
+    if (r != 0 && WSAGetLastError() == WSAEWOULDBLOCK) {
+        fd_set wr, ex;
+        FD_ZERO(&wr);
+        FD_ZERO(&ex);
+        FD_SET(s, &wr);
+        FD_SET(s, &ex);
+        struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+        r = select(0, NULL, &wr, &ex, &tv) == 1 && FD_ISSET(s, &wr) ? 0 : -1;
+    }
+    nb = 0;
+    ioctlsocket(s, FIONBIO, &nb);
+    return r;
+}
+
+static SOCKET connect_host(const char *host, int port_num) {
     char port[16];
-    snprintf(port, sizeof port, "%d", g_port);
+    snprintf(port, sizeof port, "%d", port_num);
     struct addrinfo hints = {0}, *res = NULL;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo(g_host, port, &hints, &res) != 0) return INVALID_SOCKET;
+    if (getaddrinfo(host, port, &hints, &res) != 0) return INVALID_SOCKET;
     SOCKET s = INVALID_SOCKET;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (s == INVALID_SOCKET) continue;
-        if (connect(s, ai->ai_addr, (int)ai->ai_addrlen) == 0) break;
+        if (connect_timeout(s, ai->ai_addr, (int)ai->ai_addrlen, 3000) == 0) break;
         closesocket(s);
         s = INVALID_SOCKET;
     }
@@ -397,6 +440,32 @@ static void handle_cursor_shape(const uint8_t *p, uint32_t len) {
     notify_main();
 }
 
+/// MONITORS: u8 nameLen, PC name, u8 n, then n × {u8 index, u8 selected, u32 w, h, hz, u8 len, name}
+static int send_monitors(void) {
+    uint8_t buf[2048];
+    int o = 0;
+    char pc[MAX_COMPUTERNAME_LENGTH + 1] = "PC";
+    DWORD pclen = sizeof pc;
+    GetComputerNameA(pc, &pclen);
+    buf[o++] = (uint8_t)strlen(pc);
+    memcpy(buf + o, pc, strlen(pc));
+    o += (int)strlen(pc);
+    buf[o++] = (uint8_t)g_npcmons;
+    for (int i = 0; i < g_npcmons; i++) {
+        buf[o++] = (uint8_t)i;
+        buf[o++] = (uint8_t)g_pcmons[i].selected;
+        put_u32(buf + o, (uint32_t)g_pcmons[i].w);
+        put_u32(buf + o + 4, (uint32_t)g_pcmons[i].h);
+        put_u32(buf + o + 8, (uint32_t)g_pcmons[i].hz);
+        o += 12;
+        size_t n = strlen(g_pcmons[i].name);
+        buf[o++] = (uint8_t)n;
+        memcpy(buf + o, g_pcmons[i].name, n);
+        o += (int)n;
+    }
+    return send_msg(MSG_MONITORS, 0, buf, (uint32_t)o);
+}
+
 static int send_hello(void) {
     uint8_t buf[8 + MAX_STREAMS * 20];
     put_u32(buf, PROTO_VERSION);
@@ -417,23 +486,51 @@ static int send_hello(void) {
     return send_msg(MSG_HELLO, 0, buf, 8 + g_nstreams * 20);
 }
 
+static int net_should_stop(void) { return SDL_AtomicGet(&g_quit) || SDL_AtomicGet(&g_net_stop); }
+
+/// Sleeps up to ms, waking early if the session is stopping.
+static void net_sleep(int ms) {
+    for (int t = 0; t < ms && !net_should_stop(); t += 50) SDL_Delay(50);
+}
+
+static void post_status(int connected, int gen) {
+    SDL_Event ev = {0};
+    ev.type = g_cmd_event;
+    ev.user.code = CMD_INTERNAL_STATUS;
+    ev.user.data1 = (void *)(intptr_t)connected;
+    ev.user.data2 = (void *)(intptr_t)gen;
+    SDL_PushEvent(&ev);
+}
+
 static int net_thread(void *unused) {
     (void)unused;
     uint8_t *buf = NULL;
     uint32_t cap = 0;
-    while (!SDL_AtomicGet(&g_quit)) {
-        LOG("net: connecting to %s:%d", g_host, g_port);
-        SOCKET s = connect_host();
+    int gen = SDL_AtomicGet(&g_session_gen);
+    while (!net_should_stop()) {
+        char host[64];
+        int port;
+        SDL_LockMutex(g_shared_lock);
+        snprintf(host, sizeof host, "%s", g_cfg.host);
+        port = g_cfg.port;
+        SDL_UnlockMutex(g_shared_lock);
+        if (!host[0]) {  // no Mac chosen yet: discovery will fill one in
+            net_sleep(500);
+            continue;
+        }
+        LOG("net: connecting to %s:%d", host, port);
+        SOCKET s = connect_host(host, port);
         if (s == INVALID_SOCKET) {
             LOG("net: connect failed, retrying in 2s");
-            SDL_Delay(2000);
+            net_sleep(2000);
             continue;
         }
         SDL_LockMutex(g_send_lock);
         g_sock = s;
         SDL_UnlockMutex(g_send_lock);
+        if (net_should_stop()) goto disconnected;
         LOG("net: connected");
-        if (send_hello() < 0) goto disconnected;
+        if (send_hello() < 0 || send_monitors() < 0) goto disconnected;
 
         for (;;) {
             uint8_t hdr[8];
@@ -452,8 +549,24 @@ static int net_thread(void *unused) {
             memset(buf + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 
             switch (type) {
-            case MSG_HELLO_ACK:
-                LOG("net: host protocol v%u", len >= 4 ? get_u32(buf) : 0);
+            case MSG_HELLO_ACK: {
+                char name[128] = "";
+                if (len >= 5) {
+                    int n = buf[4] < len - 5 ? buf[4] : (int)len - 5;
+                    if (n > (int)sizeof name - 1) n = sizeof name - 1;
+                    memcpy(name, buf + 5, n);
+                    name[n] = 0;
+                }
+                LOG("net: host \"%s\" protocol v%u", name, len >= 4 ? get_u32(buf) : 0);
+                SDL_LockMutex(g_shared_lock);
+                snprintf(g_net_host_name, sizeof g_net_host_name, "%s", name);
+                SDL_UnlockMutex(g_shared_lock);
+                SDL_AtomicSet(&g_connected, 1);
+                post_status(1, gen);
+                break;
+            }
+            case MSG_SET_MONITORS:
+                if (len >= 4) app_post_command(CMD_SET_MONITOR_MASK, (int)get_u32(buf));
                 break;
             case MSG_STREAM_INFO:
                 if (stream < g_nstreams && len >= 16) {
@@ -494,6 +607,10 @@ static int net_thread(void *unused) {
         }
     disconnected:
         LOG("net: disconnected");
+        if (SDL_AtomicGet(&g_connected)) {
+            SDL_AtomicSet(&g_connected, 0);
+            post_status(0, gen);
+        }
         SDL_LockMutex(g_send_lock);
         closesocket(s);
         g_sock = INVALID_SOCKET;
@@ -504,7 +621,7 @@ static int net_thread(void *unused) {
             SDL_ClearQueuedAudio(g_audio);
             g_audio_playing = 0;
         }
-        if (!SDL_AtomicGet(&g_quit)) SDL_Delay(1000);
+        net_sleep(1000);
     }
     free(buf);
     return 0;
@@ -828,36 +945,349 @@ static int forward_input(const SDL_Event *ev) {
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: softkvm HOST [--port P] [--monitor N[:WxH@FPS]]... [--sw-decode]\n"
-            "                    [--start-hidden] [--mac-modifiers]\n"
-            "  Without --monitor every PC monitor gets a stream at its native mode (max 60 fps).\n"
-            "  --mac-modifiers  Ctrl stays Control and the Windows key is Command\n"
-            "                   (default: Ctrl acts as Command, so Ctrl+C/V copy and paste).\n"
+            "usage: softkvm [MAC_ADDRESS] [--port P] [--monitor N[:WxH@FPS]]... [--sw-decode]\n"
+            "               [--start-hidden] [--mac-modifiers]\n"
+            "  Settings (Mac, monitors, keyboard) are normally chosen from the tray icon and saved.\n"
             "  Ctrl+Alt+Space switches between Mac and PC. Ctrl+Alt+Q quits.\n");
 }
 
-static int add_monitor(const char *spec) {
+// ---------------------------------------------------------------------------
+// Monitors and sessions (main thread)
+
+/// Reads every PC monitor and marks which ones the saved settings select.
+static void refresh_pc_monitors(void) {
+    g_npcmons = 0;
+    int any_selected = 0;
+    for (int i = 0; i < SDL_GetNumVideoDisplays() && g_npcmons < MAX_STREAMS; i++) {
+        PCMonitor *m = &g_pcmons[g_npcmons++];
+        memset(m, 0, sizeof *m);
+        snprintf(m->name, sizeof m->name, "%s", SDL_GetDisplayName(i) ? SDL_GetDisplayName(i) : "Monitor");
+        SDL_Rect b;
+        SDL_GetDisplayBounds(i, &b);
+        m->x = b.x;
+        m->y = b.y;
+        SDL_DisplayMode dm;
+        SDL_GetDesktopDisplayMode(i, &dm);
+        m->w = dm.w;
+        m->h = dm.h;
+        m->hz = dm.refresh_rate;
+        // Saved selection is a ';'-separated list of monitor names.
+        char list[520];
+        snprintf(list, sizeof list, ";%s;", g_cfg.monitors);
+        char key[80];
+        snprintf(key, sizeof key, ";%s;", m->name);
+        m->selected = g_cfg.monitors[0] == 0 || strstr(list, key) != NULL;
+        any_selected |= m->selected;
+    }
+    if (!any_selected)
+        for (int i = 0; i < g_npcmons; i++) g_pcmons[i].selected = 1;
+}
+
+static void save_monitor_selection(void) {
+    char list[512] = "";
+    for (int i = 0; i < g_npcmons; i++) {
+        if (!g_pcmons[i].selected) continue;
+        if (list[0]) strncat(list, ";", sizeof list - strlen(list) - 1);
+        strncat(list, g_pcmons[i].name, sizeof list - strlen(list) - 1);
+    }
+    SDL_LockMutex(g_shared_lock);
+    snprintf(g_cfg.monitors, sizeof g_cfg.monitors, "%s", list);
+    SDL_UnlockMutex(g_shared_lock);
+    config_save(&g_cfg);
+}
+
+static int add_stream(int monitor, int w, int h, int fps) {
     if (g_nstreams >= MAX_STREAMS) return -1;
     Stream *s = &g_streams[g_nstreams];
     memset(s, 0, sizeof *s);
-    s->monitor = atoi(spec);
-    if (s->monitor < 0 || s->monitor >= SDL_GetNumVideoDisplays()) {
-        fprintf(stderr, "no monitor %d (have %d)\n", s->monitor, SDL_GetNumVideoDisplays());
-        return -1;
-    }
+    s->monitor = monitor;
     SDL_DisplayMode m;
-    SDL_GetDesktopDisplayMode(s->monitor, &m);
-    s->w = m.w;
-    s->h = m.h;
-    s->fps = m.refresh_rate > 0 && m.refresh_rate < 60 ? m.refresh_rate : 60;
-    const char *colon = strchr(spec, ':');
-    if (colon && sscanf(colon + 1, "%dx%d@%d", &s->w, &s->h, &s->fps) < 2) return -1;
+    SDL_GetDesktopDisplayMode(monitor, &m);
+    s->w = w > 0 ? w : m.w;
+    s->h = h > 0 ? h : m.h;
+    s->fps = fps > 0 ? fps : (m.refresh_rate > 0 && m.refresh_rate < 60 ? m.refresh_rate : 60);
     g_nstreams++;
     return 0;
 }
 
+static int parse_monitor_arg(const char *spec) {
+    int idx = atoi(spec), w = 0, h = 0, fps = 0;
+    if (idx < 0 || idx >= SDL_GetNumVideoDisplays()) {
+        fprintf(stderr, "no monitor %d (have %d)\n", idx, SDL_GetNumVideoDisplays());
+        return -1;
+    }
+    const char *colon = strchr(spec, ':');
+    if (colon && sscanf(colon + 1, "%dx%d@%d", &w, &h, &fps) < 2) return -1;
+    g_cli_monitors = 1;
+    return add_stream(idx, w, h, fps);
+}
+
+static void reset_remote_state(void) {
+    SDL_LockMutex(g_shared_lock);
+    g_net_nlayout = 0;
+    g_net_layout_version++;
+    g_net_cursor_pos_pending = 0;
+    SDL_UnlockMutex(g_shared_lock);
+    g_cursor_valid = 0;
+}
+
+static void start_session(void) {
+    if (!g_cli_monitors) {
+        g_nstreams = 0;
+        for (int i = 0; i < g_npcmons; i++)
+            if (g_pcmons[i].selected) add_stream(i, 0, 0, 0);
+    }
+    for (int i = 0; i < g_nstreams; i++) {
+        Stream *s = &g_streams[i];
+        s->lock = SDL_CreateMutex();
+        s->ready = av_frame_alloc();
+        s->frame = av_frame_alloc();
+        s->sw = av_frame_alloc();
+        s->pkt = av_packet_alloc();
+        s->stats_start = SDL_GetTicks();
+        create_window(s, i);
+        if (!g_mac_mode) SDL_HideWindow(s->win);
+        LOG("stream %d -> monitor %d (%s), requesting %dx%d@%d", i, s->monitor, SDL_GetDisplayName(s->monitor),
+            s->w, s->h, s->fps);
+    }
+    SDL_AtomicSet(&g_net_stop, 0);
+    g_net_thread = SDL_CreateThread(net_thread, "net", NULL);
+}
+
+static void stop_session(void) {
+    SDL_AtomicIncRef(&g_session_gen);  // status events from the old session are ignored
+    SDL_AtomicSet(&g_net_stop, 1);
+    SDL_LockMutex(g_send_lock);
+    if (g_sock != INVALID_SOCKET) shutdown(g_sock, SD_BOTH);
+    SDL_UnlockMutex(g_send_lock);
+    if (g_net_thread) SDL_WaitThread(g_net_thread, NULL);
+    g_net_thread = NULL;
+    for (int i = 0; i < g_nstreams; i++) {
+        Stream *s = &g_streams[i];
+        stream_close_decoder(s);
+        av_frame_free(&s->ready);
+        av_frame_free(&s->frame);
+        av_frame_free(&s->sw);
+        av_packet_free(&s->pkt);
+        if (s->tex) SDL_DestroyTexture(s->tex);
+        if (s->cursor_tex) SDL_DestroyTexture(s->cursor_tex);
+        if (s->ren) SDL_DestroyRenderer(s->ren);
+        if (s->win) SDL_DestroyWindow(s->win);
+        if (s->lock) SDL_DestroyMutex(s->lock);
+        memset(s, 0, sizeof *s);
+    }
+    if (!g_cli_monitors) g_nstreams = 0;
+    reset_remote_state();
+}
+
+/// Applies a new monitor selection: the Mac recreates its displays to match.
+static void restart_session(void) {
+    int was_mac = g_mac_mode;
+    if (g_mac_mode) set_mac_mode(0);
+    stop_session();
+    start_session();
+    if (was_mac) g_mac_mode = 1;  // re-entered once the new session connects
+}
+
+// ---------------------------------------------------------------------------
+// Tray / app commands
+
+static const wchar_t *RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+static int autostart_enabled(void) {
+    return RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, L"SoftKVM", RRF_RT_REG_SZ, NULL, NULL, NULL) == ERROR_SUCCESS;
+}
+
+static void set_autostart(int on) {
+    if (on) {
+        wchar_t exe[MAX_PATH], cmd[MAX_PATH + 32];
+        GetModuleFileNameW(NULL, exe, MAX_PATH);
+        _snwprintf(cmd, MAX_PATH + 32, L"\"%ls\" --start-hidden", exe);
+        RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, L"SoftKVM", REG_SZ, cmd,
+                        (DWORD)((wcslen(cmd) + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, L"SoftKVM");
+    }
+    LOG("autostart: %s", on ? "on" : "off");
+}
+
+void app_post_command(int cmd, int arg) {
+    SDL_Event ev = {0};
+    ev.type = g_cmd_event;
+    ev.user.code = cmd;
+    ev.user.data1 = (void *)(intptr_t)arg;
+    SDL_PushEvent(&ev);
+}
+
+void app_snapshot(AppSnapshot *out) {
+    memset(out, 0, sizeof *out);
+    out->connected = SDL_AtomicGet(&g_connected);
+    out->mac_mode = g_mac_mode;
+    out->pc_style_modifiers = g_pc_style_modifiers;
+    out->autostart = autostart_enabled();
+    out->searching = SDL_AtomicGet(&g_searching);
+    out->nmonitors = g_npcmons;
+    for (int i = 0; i < g_npcmons && i < APP_MAX_MONITORS; i++) {
+        snprintf(out->monitors[i].name, sizeof out->monitors[i].name, "%s", g_pcmons[i].name);
+        out->monitors[i].w = g_pcmons[i].w;
+        out->monitors[i].h = g_pcmons[i].h;
+        out->monitors[i].hz = g_pcmons[i].hz;
+        out->monitors[i].selected = g_pcmons[i].selected;
+    }
+    SDL_LockMutex(g_shared_lock);
+    snprintf(out->host_name, sizeof out->host_name, "%s", out->connected ? g_net_host_name : g_cfg.host_name);
+    snprintf(out->host_addr, sizeof out->host_addr, "%s", g_cfg.host);
+    out->nhosts = g_nfound;
+    memcpy(out->hosts, g_found, sizeof g_found);
+    SDL_UnlockMutex(g_shared_lock);
+}
+
+static int discovery_thread(void *unused) {
+    (void)unused;
+    AppHost found[APP_MAX_HOSTS];
+    int n = discovery_run(found, APP_MAX_HOSTS, 1500);
+    SDL_LockMutex(g_shared_lock);
+    memcpy(g_found, found, sizeof found);
+    g_nfound = n;
+    SDL_UnlockMutex(g_shared_lock);
+    LOG("discovery: found %d Mac(s)%s%s", n, n ? ", first: " : "", n ? found[0].name : "");
+    SDL_AtomicSet(&g_searching, 0);
+    app_post_command(CMD_INTERNAL_DISCOVERY_DONE, 0);
+    return 0;
+}
+
+static void start_discovery(void) {
+    if (!SDL_AtomicCAS(&g_searching, 0, 1)) return;
+    g_last_search = SDL_GetTicks();
+    SDL_DetachThread(SDL_CreateThread(discovery_thread, "discovery", NULL));
+}
+
+static void select_host(const AppHost *h) {
+    SDL_LockMutex(g_shared_lock);
+    int changed = strcmp(g_cfg.host, h->addr) != 0 || g_cfg.port != h->port;
+    snprintf(g_cfg.host, sizeof g_cfg.host, "%s", h->addr);
+    snprintf(g_cfg.host_name, sizeof g_cfg.host_name, "%s", h->name);
+    g_cfg.port = h->port;
+    SDL_UnlockMutex(g_shared_lock);
+    config_save(&g_cfg);
+    LOG("mac: selected %s (%s:%d)", h->name, h->addr, h->port);
+    if (changed) restart_session();
+}
+
+static void update_tray(void) {
+    AppSnapshot st;
+    app_snapshot(&st);
+    char tip[128];
+    if (st.connected) snprintf(tip, sizeof tip, "SoftKVM — %s (%s)", st.host_name, st.mac_mode ? "on the Mac" : "on the PC");
+    else snprintf(tip, sizeof tip, "SoftKVM — %s", st.host_addr[0] ? "connecting…" : "looking for a Mac…");
+    tray_set_status(st.connected, tip);
+}
+
+static void handle_command(int cmd, int arg, int gen) {
+    switch (cmd) {
+    case CMD_TOGGLE_MODE:
+        if (!g_mac_mode && !SDL_AtomicGet(&g_connected)) {
+            LOG("mode: not connected to a Mac; staying on the PC");
+            break;
+        }
+        toggle_mode();
+        break;
+    case CMD_TOGGLE_MONITOR: {
+        if (arg < 0 || arg >= g_npcmons) break;
+        int selected = 0;
+        for (int i = 0; i < g_npcmons; i++) selected += g_pcmons[i].selected;
+        if (g_pcmons[arg].selected && selected == 1) break;  // keep at least one
+        g_pcmons[arg].selected = !g_pcmons[arg].selected;
+        g_cli_monitors = 0;
+        save_monitor_selection();
+        restart_session();
+        break;
+    }
+    case CMD_SET_MONITOR_MASK: {
+        unsigned mask = (unsigned)arg;
+        int any = 0;
+        for (int i = 0; i < g_npcmons; i++) any |= (mask >> i) & 1;
+        if (!any) break;
+        int changed = 0;
+        for (int i = 0; i < g_npcmons; i++) {
+            int on = (mask >> i) & 1;
+            changed |= on != g_pcmons[i].selected;
+            g_pcmons[i].selected = on;
+        }
+        if (!changed) break;
+        LOG("monitors: the Mac asked for mask %u", mask);
+        g_cli_monitors = 0;
+        save_monitor_selection();
+        restart_session();
+        break;
+    }
+    case CMD_SELECT_HOST: {
+        AppHost h;
+        SDL_LockMutex(g_shared_lock);
+        int ok = arg >= 0 && arg < g_nfound;
+        if (ok) h = g_found[arg];
+        SDL_UnlockMutex(g_shared_lock);
+        if (ok) select_host(&h);
+        break;
+    }
+    case CMD_SET_MODIFIERS:
+        g_pc_style_modifiers = arg != 0;
+        g_cfg.pc_style_modifiers = g_pc_style_modifiers;
+        config_save(&g_cfg);
+        if (g_mac_mode) send_release_all();
+        break;
+    case CMD_TOGGLE_AUTOSTART:
+        set_autostart(!autostart_enabled());
+        break;
+    case CMD_OPEN_LOG: {
+        char path[MAX_PATH];
+        snprintf(path, sizeof path, "%ssoftkvm.log", exe_dir());
+        ShellExecuteA(NULL, "open", path, NULL, NULL, SW_SHOWNORMAL);
+        break;
+    }
+    case CMD_SEARCH:
+        start_discovery();
+        break;
+    case CMD_QUIT:
+        SDL_AtomicSet(&g_quit, 1);
+        break;
+    case CMD_INTERNAL_STATUS:
+        if (gen != SDL_AtomicGet(&g_session_gen)) break;  // from a session we already replaced
+        if (arg) {
+            // Reconnected after a monitor change while on the Mac: show the new windows.
+            if (g_mac_mode) set_mac_mode(1);
+        } else if (g_mac_mode) {
+            LOG("mode: lost the Mac; back to the PC");
+            set_mac_mode(0);
+        }
+        break;
+    case CMD_INTERNAL_DISCOVERY_DONE: {
+        // First run: no Mac chosen yet, so connect to the first one found.
+        SDL_LockMutex(g_shared_lock);
+        int pick = !g_cfg.host[0] && g_nfound > 0;
+        AppHost h;
+        if (pick) h = g_found[0];
+        SDL_UnlockMutex(g_shared_lock);
+        if (pick) select_host(&h);
+        break;
+    }
+    default:
+        break;
+    }
+    update_tray();
+}
+
 int main(int argc, char **argv) {
-    g_logfile = fopen("softkvm.log", "a");
+    char logpath[MAX_PATH];
+    snprintf(logpath, sizeof logpath, "%ssoftkvm.log", exe_dir());
+    g_logfile = fopen(logpath, "a");
+
+    // One instance per user: a second launch just exits.
+    CreateMutexW(NULL, TRUE, L"Local\\SoftKVMClient");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        LOG("another SoftKVM is already running; exiting");
+        return 0;
+    }
 
     SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
@@ -873,27 +1303,21 @@ int main(int argc, char **argv) {
     }
     SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT709);
 
+    config_load(&g_cfg);
+    g_pc_style_modifiers = g_cfg.pc_style_modifiers;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--port") && i + 1 < argc) g_port = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--port") && i + 1 < argc) g_cfg.port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--monitor") && i + 1 < argc) {
-            if (add_monitor(argv[++i]) < 0) { usage(); return 1; }
+            if (parse_monitor_arg(argv[++i]) < 0) { usage(); return 1; }
         } else if (!strcmp(argv[i], "--sw-decode")) g_force_sw = 1;
         else if (!strcmp(argv[i], "--start-hidden")) g_start_hidden = 1;
         else if (!strcmp(argv[i], "--mac-modifiers")) g_pc_style_modifiers = 0;
-        else if (argv[i][0] != '-' && !g_host[0]) snprintf(g_host, sizeof g_host, "%s", argv[i]);
-        else { usage(); return 1; }
+        else if (argv[i][0] != '-') {
+            snprintf(g_cfg.host, sizeof g_cfg.host, "%s", argv[i]);
+            config_save(&g_cfg);
+        } else { usage(); return 1; }
     }
-    if (!g_host[0]) { usage(); return 1; }
-    if (g_nstreams == 0) {
-        for (int i = 0; i < SDL_GetNumVideoDisplays() && i < MAX_STREAMS; i++) {
-            char spec[8];
-            snprintf(spec, sizeof spec, "%d", i);
-            add_monitor(spec);
-        }
-    }
-    for (int i = 0; i < g_nstreams; i++)
-        LOG("stream %d -> monitor %d (%s), requesting %dx%d@%d", i, g_streams[i].monitor,
-            SDL_GetDisplayName(g_streams[i].monitor), g_streams[i].w, g_streams[i].h, g_streams[i].fps);
+    refresh_pc_monitors();
 
     SDL_AudioSpec want = {0}, have;
     want.freq = AUDIO_RATE;
@@ -912,37 +1336,22 @@ int main(int argc, char **argv) {
         g_hw_device = NULL;
     }
 
-    g_frame_event = SDL_RegisterEvents(1);
+    g_frame_event = SDL_RegisterEvents(2);
+    g_cmd_event = g_frame_event + 1;
     g_send_lock = SDL_CreateMutex();
     g_shared_lock = SDL_CreateMutex();
-    for (int i = 0; i < g_nstreams; i++) {
-        Stream *s = &g_streams[i];
-        s->lock = SDL_CreateMutex();
-        s->ready = av_frame_alloc();
-        s->frame = av_frame_alloc();
-        s->sw = av_frame_alloc();
-        s->pkt = av_packet_alloc();
-        s->stats_start = SDL_GetTicks();
-        if (create_window(s, i) < 0) return 1;
-    }
-
-    // Global hotkey: works in PC mode too, when our windows are hidden.
-    SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
     SDL_StopTextInput();
-    {
-        SDL_SysWMinfo wm;
-        SDL_VERSION(&wm.version);
-        if (SDL_GetWindowWMInfo(g_streams[0].win, &wm) &&
-            RegisterHotKey(wm.info.win.window, HOTKEY_ID_TOGGLE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE)) {
-            g_hotkey_registered = 1;
-            LOG("hotkey: Ctrl+Alt+Space registered");
-        } else {
-            LOG("hotkey: could not register Ctrl+Alt+Space globally (in use?); it only works in Mac mode");
-        }
-    }
-    set_mac_mode(!g_start_hidden);
 
-    SDL_Thread *net = SDL_CreateThread(net_thread, "net", NULL);
+    if (tray_init() < 0) LOG("tray: could not create the notification icon");
+    LOG(tray_hotkey_registered() ? "hotkey: Ctrl+Alt+Space registered"
+                                 : "hotkey: Ctrl+Alt+Space is taken by another app; it only works in Mac mode");
+
+    // Start on the PC; switch to the Mac once connected (unless started hidden).
+    g_mac_mode = 0;
+    start_session();
+    int want_mac_on_connect = !g_start_hidden;
+    start_discovery();
+    update_tray();
 
     while (!SDL_AtomicGet(&g_quit)) {
         SDL_Event ev;
@@ -953,16 +1362,20 @@ int main(int argc, char **argv) {
         if (got) do {
             if (ev.type == SDL_QUIT) {
                 SDL_AtomicSet(&g_quit, 1);
-            } else if (ev.type == SDL_SYSWMEVENT) {
-                if (ev.syswm.msg->msg.win.msg == WM_HOTKEY && ev.syswm.msg->msg.win.wParam == HOTKEY_ID_TOGGLE)
-                    toggle_mode();
+            } else if (ev.type == g_cmd_event) {
+                int cmd = ev.user.code, arg = (int)(intptr_t)ev.user.data1, gen = (int)(intptr_t)ev.user.data2;
+                if (cmd == CMD_INTERNAL_STATUS && arg && want_mac_on_connect &&
+                    gen == SDL_AtomicGet(&g_session_gen)) {
+                    want_mac_on_connect = 0;
+                    g_mac_mode = 1;  // handle_command shows the Mac windows
+                }
+                handle_command(cmd, arg, gen);
             } else if (ev.type == SDL_KEYDOWN && (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_ALT) &&
                        (ev.key.keysym.sym == SDLK_q || ev.key.keysym.sym == SDLK_SPACE)) {
-                // Local hotkeys are never forwarded.
-                // In Mac mode the keyboard grab swallows Ctrl+Alt+Space before Windows' hotkey
-                // sees it, so handle it here too (toggle_mode debounces duplicates).
+                // Local hotkeys are never forwarded. In Mac mode the keyboard grab swallows
+                // Ctrl+Alt+Space before Windows' hotkey sees it (toggle_mode debounces duplicates).
                 if (ev.key.keysym.sym == SDLK_q) SDL_AtomicSet(&g_quit, 1);
-                else toggle_mode();
+                else handle_command(CMD_TOGGLE_MODE, 0, 0);
             } else if (ev.type == SDL_WINDOWEVENT) {
                 if (ev.window.event == SDL_WINDOWEVENT_EXPOSED && g_mac_mode) {
                     int i = stream_for_window(ev.window.windowID);
@@ -974,6 +1387,8 @@ int main(int argc, char **argv) {
                 } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                     check_focus = 1;
                 }
+            } else if (ev.type == SDL_DISPLAYEVENT && !g_mac_mode) {
+                refresh_pc_monitors();  // monitor plugged/unplugged: refresh the menu's list
             } else if (g_mac_mode) {
                 forward_input(&ev);
             }
@@ -988,6 +1403,10 @@ int main(int argc, char **argv) {
             send_release_all();
         }
 
+        // Keep looking for Macs while we have none.
+        if (!SDL_AtomicGet(&g_connected) && !g_cfg.host[0] && SDL_GetTicks() - g_last_search > 5000)
+            start_discovery();
+
         if (!g_mac_mode) continue;  // keep decoding in the background, draw when shown
         Uint32 now = SDL_GetTicks();
         for (int i = 0; i < g_nstreams; i++) {
@@ -1001,11 +1420,9 @@ int main(int argc, char **argv) {
     }
 
     LOG("quitting");
-    send_release_all();
-    SDL_LockMutex(g_send_lock);
-    if (g_sock != INVALID_SOCKET) shutdown(g_sock, SD_BOTH);
-    SDL_UnlockMutex(g_send_lock);
-    SDL_WaitThread(net, NULL);
+    if (g_mac_mode) send_release_all();
+    stop_session();
+    tray_shutdown();
     SDL_Quit();
     WSACleanup();
     return 0;
