@@ -33,6 +33,7 @@ enum {
     MSG_HELLO_ACK = 0x01,
     MSG_STREAM_INFO = 0x02,
     MSG_VIDEO = 0x03,
+    MSG_AUDIO = 0x04,
     MSG_HELLO = 0x81,
     MSG_KEYFRAME_REQUEST = 0x82,
     MSG_INPUT = 0x90,
@@ -79,6 +80,15 @@ static SOCKET g_sock = INVALID_SOCKET;
 static SDL_mutex *g_send_lock;
 static AVBufferRef *g_hw_device;
 static FILE *g_logfile;
+
+// Audio: s16le stereo @ 48 kHz pushed into an SDL queue. Playback starts once a small
+// cushion is buffered; if the queue grows (clock drift, hiccups) it is reset to stay low-latency.
+#define AUDIO_RATE 48000
+#define AUDIO_BYTES_PER_MS (AUDIO_RATE * 4 / 1000)
+#define AUDIO_START_MS 30
+#define AUDIO_MAX_MS 150
+static SDL_AudioDeviceID g_audio;
+static int g_audio_playing;
 
 static void logf_(const char *fmt, ...) {
     char buf[1024];
@@ -269,6 +279,29 @@ static void decode_video(int idx, uint8_t *payload, uint32_t len) {
     }
 }
 
+static void play_audio(const uint8_t *payload, uint32_t len) {
+    if (!g_audio || len <= 8) return;
+    const uint8_t *pcm = payload + 8;
+    uint32_t n = (len - 8) & ~3u;
+    Uint32 queued = SDL_GetQueuedAudioSize(g_audio);
+    if (queued > AUDIO_MAX_MS * AUDIO_BYTES_PER_MS) {
+        // Too far behind: drop the backlog and re-buffer from here.
+        SDL_ClearQueuedAudio(g_audio);
+        SDL_PauseAudioDevice(g_audio, 1);
+        g_audio_playing = 0;
+        queued = 0;
+    }
+    SDL_QueueAudio(g_audio, pcm, n);
+    if (!g_audio_playing && queued + n >= AUDIO_START_MS * AUDIO_BYTES_PER_MS) {
+        SDL_PauseAudioDevice(g_audio, 0);
+        g_audio_playing = 1;
+    } else if (g_audio_playing && queued == 0) {
+        // Underrun: pause so the next packets build a fresh cushion.
+        SDL_PauseAudioDevice(g_audio, 1);
+        g_audio_playing = 0;
+    }
+}
+
 static int send_hello(void) {
     uint8_t buf[8 + MAX_STREAMS * 12];
     put_u32(buf, PROTO_VERSION);
@@ -329,6 +362,9 @@ static int net_thread(void *unused) {
             case MSG_VIDEO:
                 if (stream < g_nstreams) decode_video(stream, buf, len);
                 break;
+            case MSG_AUDIO:
+                play_audio(buf, len);
+                break;
             default:
                 break;
             }
@@ -340,6 +376,11 @@ static int net_thread(void *unused) {
         g_sock = INVALID_SOCKET;
         SDL_UnlockMutex(g_send_lock);
         for (int i = 0; i < g_nstreams; i++) stream_close_decoder(&g_streams[i]);
+        if (g_audio) {
+            SDL_PauseAudioDevice(g_audio, 1);
+            SDL_ClearQueuedAudio(g_audio);
+            g_audio_playing = 0;
+        }
         if (!SDL_AtomicGet(&g_quit)) SDL_Delay(1000);
     }
     free(buf);
@@ -447,7 +488,7 @@ int main(int argc, char **argv) {
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
@@ -472,6 +513,15 @@ int main(int argc, char **argv) {
     for (int i = 0; i < g_nstreams; i++)
         LOG("stream %d -> monitor %d (%s), requesting %dx%d@%d", i, g_streams[i].monitor,
             SDL_GetDisplayName(g_streams[i].monitor), g_streams[i].w, g_streams[i].h, g_streams[i].fps);
+
+    SDL_AudioSpec want = {0}, have;
+    want.freq = AUDIO_RATE;
+    want.format = AUDIO_S16LSB;
+    want.channels = 2;
+    want.samples = 256;  // ~5 ms device buffer
+    g_audio = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (g_audio) LOG("audio: output %d Hz, %d ch, %d-sample buffer", have.freq, have.channels, have.samples);
+    else LOG("audio: no output device (%s)", SDL_GetError());
 
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);

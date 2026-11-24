@@ -25,10 +25,11 @@ One hotkey on the PC flips between "Mac mode" and "PC mode".
 
 ## Status
 
-- [ ] Milestone 1: one Mac virtual display → one PC window (host verified; PC client built, untested on hardware)
+- [x] Milestone 1: Mac virtual displays → PC windows (tested with two displays)
 - [ ] Milestone 2: keyboard/mouse forwarding + Mac/PC hotkey
-- [ ] Milestone 3: two displays
-- [ ] Milestone 4: audio, clipboard, auto-reconnect, start on login
+- [x] Milestone 3: two displays
+- [x] Audio (system audio, uncompressed PCM)
+- [ ] Milestone 4: clipboard, auto-reconnect, start on login
 
 ## Protocol (v0)
 
@@ -43,6 +44,7 @@ Host → client
 | `0x01` | HELLO_ACK | `u32 version` |
 | `0x02` | STREAM_INFO | `u32 width, u32 height, u32 fps, u32 codec` (1 = HEVC, 2 = H.264) |
 | `0x03` | VIDEO | `u64 pts_us, u8 flags` (bit 0 = keyframe), then Annex B bitstream |
+| `0x04` | AUDIO | `u64 pts_us`, then s16le stereo PCM @ 48 kHz (system audio) |
 
 Client → host
 

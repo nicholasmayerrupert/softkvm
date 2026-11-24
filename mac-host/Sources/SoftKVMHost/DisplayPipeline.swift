@@ -1,4 +1,5 @@
 import CGVirtualDisplayPrivate
+import AVFoundation
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
@@ -6,6 +7,8 @@ import ScreenCaptureKit
 /// One virtual display -> ScreenCaptureKit capture -> hardware encoder -> sink.
 final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     typealias Sink = (_ annexB: Data, _ keyframe: Bool, _ ptsMicros: UInt64) -> Void
+    /// Interleaved s16le stereo PCM at `Proto.audioSampleRate`.
+    typealias AudioSink = (_ pcm: Data, _ ptsMicros: UInt64) -> Void
 
     let index: Int
     let request: Proto.DisplayRequest
@@ -13,6 +16,8 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
 
     private let queue: DispatchQueue
     private let sink: Sink
+    private let audioSink: AudioSink?
+    private let audioQueue: DispatchQueue
     private let bitrate: Int
 
     private var virtualDisplay: AnyObject?
@@ -32,12 +37,16 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
     private var bytesOut = 0
     private var statsStart = CFAbsoluteTimeGetCurrent()
 
-    init(index: Int, request: Proto.DisplayRequest, bitrate: Int, sink: @escaping Sink) {
+    /// Pass `audioSink` on exactly one pipeline: system audio is global, not per display.
+    init(index: Int, request: Proto.DisplayRequest, bitrate: Int, sink: @escaping Sink,
+         audioSink: AudioSink? = nil) {
         self.index = index
         self.request = request
         self.bitrate = bitrate
         self.sink = sink
+        self.audioSink = audioSink
         self.queue = DispatchQueue(label: "softkvm.display.\(index)", qos: .userInteractive)
+        self.audioQueue = DispatchQueue(label: "softkvm.audio.\(index)", qos: .userInteractive)
     }
 
     func start() async throws {
@@ -85,10 +94,19 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         config.colorSpaceName = CGColorSpace.sRGB
         config.showsCursor = true
         config.queueDepth = 5
+        if audioSink != nil {
+            config.capturesAudio = true
+            config.sampleRate = Proto.audioSampleRate
+            config.channelCount = 2
+            config.excludesCurrentProcessAudio = true
+        }
 
         let filter = SCContentFilter(display: scDisplay, excludingWindows: [])
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
+        if audioSink != nil {
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+        }
         try await stream.startCapture()
         self.stream = stream
         Log.info("display \(index): capture started")
@@ -128,6 +146,10 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
     // MARK: - SCStreamOutput
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
+        if type == .audio {
+            handleAudio(sb)
+            return
+        }
         guard type == .screen, sb.isValid,
               let attachments = CMSampleBufferGetSampleAttachmentsArray(sb, createIfNecessary: false)
                 as? [[SCStreamFrameInfo: Any]],
@@ -142,6 +164,54 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Log.info("display \(index): capture stopped with error: \(error.localizedDescription)")
+    }
+
+    // MARK: - Audio (on `audioQueue`)
+
+    private var loggedAudioFormat = false
+
+    private func handleAudio(_ sb: CMSampleBuffer) {
+        guard let audioSink, sb.isValid, let fd = sb.formatDescription,
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd)?.pointee else { return }
+        if !loggedAudioFormat {
+            loggedAudioFormat = true
+            Log.info("audio: \(asbd.mSampleRate) Hz, \(asbd.mChannelsPerFrame) ch, flags=\(asbd.mFormatFlags), "
+                     + "bits=\(asbd.mBitsPerChannel)")
+        }
+        let isFloat = asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0
+        let nonInterleaved = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
+        guard isFloat, asbd.mBitsPerChannel == 32 else { return }
+        let frames = CMSampleBufferGetNumSamples(sb)
+        guard frames > 0 else { return }
+
+        var pcm = Data(count: frames * 4)  // stereo s16
+        do {
+            try sb.withAudioBufferList { abl, _ in
+                pcm.withUnsafeMutableBytes { raw in
+                    let out = raw.bindMemory(to: Int16.self)
+                    func s16(_ f: Float) -> Int16 { Int16(max(-1, min(1, f)) * 32767) }
+                    let channels = Int(asbd.mChannelsPerFrame)
+                    if nonInterleaved {
+                        let l = abl[0].mData!.assumingMemoryBound(to: Float.self)
+                        let r = (abl.count > 1 ? abl[1] : abl[0]).mData!.assumingMemoryBound(to: Float.self)
+                        for i in 0..<frames {
+                            out[2 * i] = s16(l[i])
+                            out[2 * i + 1] = s16(r[i])
+                        }
+                    } else {
+                        let p = abl[0].mData!.assumingMemoryBound(to: Float.self)
+                        for i in 0..<frames {
+                            out[2 * i] = s16(p[i * channels])
+                            out[2 * i + 1] = s16(p[i * channels + (channels > 1 ? 1 : 0)])
+                        }
+                    }
+                }
+            }
+        } catch {
+            return
+        }
+        let micros = UInt64(max(0, CMTimeGetSeconds(sb.presentationTimeStamp)) * 1_000_000)
+        audioSink(pcm, micros)
     }
 
     // MARK: - Internals (on `queue`)

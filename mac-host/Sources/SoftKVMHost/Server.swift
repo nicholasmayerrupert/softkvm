@@ -148,9 +148,12 @@ final class ClientSession: @unchecked Sendable {
         send(Proto.message(.helloAck, payload: ack))
 
         for (i, r) in requests.enumerated() {
-            let pipeline = DisplayPipeline(index: i, request: r, bitrate: bitrate) { [weak self] data, key, pts in
-                self?.sendVideo(stream: i, data: data, keyframe: key, pts: pts)
-            }
+            let pipeline = DisplayPipeline(
+                index: i, request: r, bitrate: bitrate,
+                sink: { [weak self] data, key, pts in
+                    self?.sendVideo(stream: i, data: data, keyframe: key, pts: pts)
+                },
+                audioSink: i == 0 ? { [weak self] pcm, pts in self?.sendAudio(pcm: pcm, pts: pts) } : nil)
             pipelines.append(pipeline)
 
             var info = Data()
@@ -195,6 +198,18 @@ final class ClientSession: @unchecked Sendable {
                 }
             }
         })
+    }
+
+    private func sendAudio(pcm: Data, pts: UInt64) {
+        // Audio is tiny; only drop it if the link is badly backed up.
+        pendingLock.lock()
+        let pending = pendingBytes
+        pendingLock.unlock()
+        if pending > Self.hardLimit { return }
+        var payload = Data(capacity: 8 + pcm.count)
+        payload.appendLE(pts)
+        payload.append(pcm)
+        send(Proto.message(.audio, payload: payload))
     }
 
     private func sendVideo(stream: Int, data: Data, keyframe: Bool, pts: UInt64) {

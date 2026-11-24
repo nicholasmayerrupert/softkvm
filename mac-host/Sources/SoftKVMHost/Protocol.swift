@@ -7,12 +7,14 @@ enum Proto {
     static let port: UInt16 = 47900
     static let headerSize = 8
     static let maxPayload = 64 * 1024 * 1024
+    static let audioSampleRate = 48_000
 
     enum MsgType: UInt8 {
         // host -> client
         case helloAck = 0x01
         case streamInfo = 0x02
         case video = 0x03
+        case audio = 0x04
         // client -> host
         case hello = 0x81
         case keyframeRequest = 0x82
