@@ -60,6 +60,33 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         self.audioQueue = DispatchQueue(label: "softkvm.audio.\(index)", qos: .userInteractive)
     }
 
+    /// Called (on an arbitrary thread) when capture dies on its own, e.g. the display went away.
+    var onCaptureFailed: (() -> Void)?
+
+    // stop() can run while start() is suspended at an await; start() checks this after each one
+    // and tears down whatever it created late.
+    private let lifecycleLock = NSLock()
+    private var stopped = false
+    private var isStopped: Bool { lifecycleLock.lock(); defer { lifecycleLock.unlock() }; return stopped }
+
+    private func abandonLateStart() async -> CancellationError {
+        let stream = self.stream
+        self.stream = nil
+        try? await stream?.stopCapture()
+        queue.sync {
+            encoder?.invalidate()
+            encoder = nil
+        }
+        refreshTimer?.cancel()
+        refreshTimer = nil
+        if let obj = virtualDisplay {
+            DispatchQueue.main.async { _ = obj }  // removes the display
+        }
+        virtualDisplay = nil
+        Log.info("display \(index): stopped while starting; cleaned up")
+        return CancellationError()
+    }
+
     func start() async throws {
         let w = Int(request.width), h = Int(request.height), fps = Int(request.fps)
 
@@ -85,15 +112,17 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             Log.info("display \(index): created virtual display id=\(id) \(w)x\(h)@\(fps)")
         }
         displayID = id
+        if isStopped { throw await abandonLateStart() }
 
         // The new display shows up in ScreenCaptureKit asynchronously.
         var scDisplay: SCDisplay?
         for _ in 0..<40 {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
             scDisplay = content.displays.first { $0.displayID == id }
-            if scDisplay != nil { break }
+            if scDisplay != nil || isStopped { break }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
+        if isStopped { throw await abandonLateStart() }
         guard let scDisplay else {
             throw NSError(domain: "SoftKVM", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "virtual display never appeared in ScreenCaptureKit"])
@@ -132,6 +161,7 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         }
         try await stream.startCapture()
         self.stream = stream
+        if isStopped { throw await abandonLateStart() }
         Log.info("display \(index): capture started")
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -144,6 +174,7 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
     /// Stops capture. With `keepDisplay`, returns the virtual display instead of removing it.
     @discardableResult
     func stop(keepDisplay: Bool = false) -> VirtualDisplayHandle? {
+        lifecycleLock.lock(); stopped = true; lifecycleLock.unlock()
         refreshTimer?.cancel()
         refreshTimer = nil
         let stream = self.stream
@@ -208,6 +239,8 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         Log.info("display \(index): capture stopped with error: \(error.localizedDescription)")
+        // Without capture the PC would show a frozen picture while input still works.
+        if !isStopped { onCaptureFailed?() }
     }
 
     // MARK: - Audio (on `audioQueue`)

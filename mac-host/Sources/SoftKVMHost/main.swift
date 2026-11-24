@@ -3,6 +3,10 @@ import ScreenCaptureKit
 
 /// Menu-bar-only app: listens for a SoftKVM client and streams virtual displays to it.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        server?.shutdown(reason: "quitting")
+    }
+
     private var statusMenu: StatusMenu?
     private var server: Server?
     private var discovery: DiscoveryResponder?
@@ -37,6 +41,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
         }
         server.askPairing = { name, code, reply in PairingPrompt.ask(name: name, code: code, reply: reply) }
+        // Going to sleep: let the PC know now (and release its keys) instead of it finding out
+        // from a dead connection. It reconnects after wake.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification, object: nil, queue: nil
+        ) { [weak server] _ in server?.shutdown(reason: "Mac going to sleep") }
         self.server = server
         if !Proto.headless && !HostEnv.perf {
             statusMenu = StatusMenu(server: server)

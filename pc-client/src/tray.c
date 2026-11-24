@@ -249,6 +249,10 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         app_post_command(CMD_SELECT_DEVICE, (int)(wp - HOTKEY_DEVICE_BASE));
         return 0;
     }
+    if ((msg == WM_POWERBROADCAST && wp == PBT_APMSUSPEND) || msg == WM_QUERYENDSESSION) {
+        app_release_input_now();  // before the link dies with keys still held on the device
+        return msg == WM_QUERYENDSESSION ? TRUE : 0;
+    }
     if (msg == WM_CLOSE) {  // the installer/uninstaller asks us to quit
         app_post_command(CMD_QUIT, 0);
         return 0;

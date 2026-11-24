@@ -51,6 +51,9 @@ def main():
                 break
             t, stream, p = ch.recv()
             if t == PING:
+                # Answer with a time request, as real clients do every second; the host drops
+                # authorized clients that go silent.
+                ch.send(0xA0, struct.pack("<Q", int(time.time() * 1e6)))
                 continue
             if t == AUTH_STATUS:
                 text = p[2:2 + p[1]].decode(errors="replace") if len(p) > 1 else ""

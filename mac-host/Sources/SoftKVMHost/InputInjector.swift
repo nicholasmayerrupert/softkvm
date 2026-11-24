@@ -92,6 +92,8 @@ final class InputInjector {
     }
 
     private func moveTo(_ pt: CGPoint) {
+        // Untrusted numbers: NaN/inf or absurd values would trap in the Int conversions below.
+        guard pt.x.isFinite, pt.y.isFinite, abs(pt.x) < 1_000_000, abs(pt.y) < 1_000_000 else { return }
         lastMoveTime = ProcessInfo.processInfo.systemUptime
         let dx = pt.x - position.x, dy = pt.y - position.y
         position = pt
@@ -144,6 +146,8 @@ final class InputInjector {
     }
 
     private func scroll(dx: Double, dy: Double) {
+        guard dx.isFinite, dy.isFinite else { return }
+        let dx = min(max(dx, -50), 50), dy = min(max(dy, -50), 50)  // notches per event
         scrollRemainder.x += dx * pixelsPerNotch
         scrollRemainder.y += dy * pixelsPerNotch
         let px = Int32(scrollRemainder.x.rounded(.towardZero))

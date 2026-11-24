@@ -70,8 +70,12 @@ enum {
     CMD_RECONNECT,
     CMD_ADD_DEVICE,       // arg = index into available
     CMD_FORGET_DEVICE,    // arg = device index
+    CMD_GO_TO_PC,         // leave Mac mode (e.g. the PC is suspending)
 };
 
 void app_snapshot(AppSnapshot *out);
+/// The PC is about to suspend or shut down: lift any keys/buttons held on the device right now
+/// (safe to call from a window procedure), then leave Mac mode.
+void app_release_input_now(void);
 /// Queues a command; it runs on the next main-loop iteration (never inside a window procedure).
 void app_post_command(int cmd, int arg);

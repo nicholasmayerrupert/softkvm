@@ -1473,6 +1473,13 @@ static int ask_yes_no(const char *text) {
     return MessageBoxW(NULL, w, L"SoftKVM", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST) == IDYES;
 }
 
+void app_release_input_now(void) {
+    if (!g_mac_mode) return;
+    LOG("power: suspending or shutting down; releasing input on the device");
+    if (SDL_AtomicGet(&g_connected)) send_release_all();
+    app_post_command(CMD_GO_TO_PC, 0);
+}
+
 void app_post_command(int cmd, int arg) {
     SDL_Event ev = {0};
     ev.type = g_cmd_event;
@@ -1667,6 +1674,9 @@ static void handle_command(int cmd, int arg) {
         break;
     case CMD_RECONNECT:
         use_active_device();
+        break;
+    case CMD_GO_TO_PC:
+        if (g_mac_mode) set_mac_mode(0);
         break;
     case CMD_ADD_DEVICE: {
         AppHost avail[APP_MAX_HOSTS];

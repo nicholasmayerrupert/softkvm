@@ -73,7 +73,16 @@ SectionEnd
 Section "Uninstall"
   !insertmacro StopSoftKVM
   Delete "$SMPROGRAMS\SoftKVM.lnk"
-  RMDir /r "$INSTDIR"
+  ; Only what the installer (and the app's log) put there, so a folder the user chose survives.
+  Delete "$INSTDIR\softkvm.exe"
+  Delete "$INSTDIR\SDL2.dll"
+  Delete "$INSTDIR\avcodec-*.dll"
+  Delete "$INSTDIR\avutil-*.dll"
+  Delete "$INSTDIR\swresample-*.dll"
+  Delete "$INSTDIR\softkvm.log"
+  Delete "$INSTDIR\softkvm.log.1"
+  Delete "$INSTDIR\Uninstall SoftKVM.exe"
+  RMDir "$INSTDIR"  ; only if now empty
   DeleteRegValue HKCU "${RUN_KEY}" "SoftKVM"
   DeleteRegKey HKCU "${UNINST_KEY}"
   DeleteRegKey HKCU "Software\SoftKVM"

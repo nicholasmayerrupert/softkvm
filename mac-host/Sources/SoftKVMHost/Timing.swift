@@ -96,10 +96,12 @@ enum HostEnv {
     static let animate = env["SOFTKVM_ANIMATE"] == "1"
 
     static func displayName(_ index: Int) -> String {
-        perf ? "SoftKVM perf \(index + 1)" : "SoftKVM \(index + 1)"
+        perf ? "SoftKVM perf \(index + 1)" : Proto.headless ? "SoftKVM test \(index + 1)" : "SoftKVM \(index + 1)"
     }
 
     static func displaySerial(_ index: Int) -> UInt32 {
-        UInt32(index + 1) + (perf ? 0x5000 : 0)
+        // Test instances must not reuse the live host's serials: macOS refuses a second display
+        // with the same vendor/product/serial.
+        UInt32(index + 1) + (perf ? 0x5000 : Proto.headless ? 0x4000 : 0)
     }
 }

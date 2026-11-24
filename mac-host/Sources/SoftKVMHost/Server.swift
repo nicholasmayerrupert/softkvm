@@ -68,6 +68,22 @@ final class Server: @unchecked Sendable {
         queue.async { self.active?.sayGoodbye(.userDisconnected, "") }
     }
 
+    /// The Mac is quitting or going to sleep: release input and tell every client why, so the PC
+    /// shows the right state and reconnects later. Blocks briefly so the goodbye goes out.
+    func shutdown(reason: String) {
+        queue.sync {
+            Log.info("server: \(reason); saying goodbye to connected PCs")
+            if let a = active {
+                active = nil
+                a.sayGoodbye(.hostQuitting, "")
+            }
+            for s in waiting { s.sayGoodbye(.hostQuitting, "") }
+            waiting.removeAll()
+            setStayAwake(false)
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+    }
+
     /// Forgets a paired PC and disconnects it if it's here.
     func unpair(key: Data) {
         TrustStore.shared.remove(key: key)
@@ -113,6 +129,8 @@ final class Server: @unchecked Sendable {
         if let a = active, a !== s {
             if a.clientKey == s.clientKey {
                 // The same PC reconnecting (e.g. its old connection died silently): replace it.
+                // Clear `active` first so closing it doesn't hand control to a waiting PC.
+                active = nil
                 a.close(reason: "replaced by the same PC reconnecting", keepDisplays: true)
             } else {
                 Log.info("server: \(s.clientName) is waiting; \(a.clientName) is in control")
@@ -139,8 +157,9 @@ final class Server: @unchecked Sendable {
         guard s.state == .busy else { return }
         if let a = active {
             Log.info("server: \(s.clientName) takes over from \(a.clientName)")
-            a.sayGoodbye(.takenOver, s.clientName, keepDisplays: true)
-            active = nil
+            active = nil  // before revoking, so the old session's close doesn't promote anyone
+            // A different PC: its displays don't carry over, so don't keep them around.
+            a.sayGoodbye(.takenOver, s.clientName, keepDisplays: false)
         }
         makeActive(s, code: .ok)
     }
@@ -234,6 +253,10 @@ final class ClientSession: @unchecked Sendable {
     private var lastLayout: [DisplayLayout.Entry] = []
     private var lastSentCursorPos = CGPoint(x: -100_000, y: -100_000)
     private var streamsReady = false
+    /// Last time anything arrived from the client. Authorized clients send at least one message a
+    /// second (time sync), so silence means the link is dead: drop it before held keys linger.
+    private var lastReceived = ProcessInfo.processInfo.systemUptime
+    private static let silenceLimit: TimeInterval = 5
 
     // Backpressure: bytes handed to the socket but not yet sent.
     private let pendingLock = NSLock()
@@ -361,6 +384,7 @@ final class ClientSession: @unchecked Sendable {
                 guard let plain = self.cipher?.open(header: header, body: body) else {
                     return self.close(reason: "record failed authentication", keepDisplays: true)
                 }
+                self.lastReceived = ProcessInfo.processInfo.systemUptime
                 self.handleMessage(plain)
                 if self.state != .closed { self.readRecord() }
             }
@@ -387,8 +411,8 @@ final class ClientSession: @unchecked Sendable {
         default:
             break
         }
-        // Everything else needs an approved, in-control session.
-        guard state == .authorized || state == .streaming else { return }
+        // Everything else needs an approved session that is the one in control.
+        guard state == .authorized || state == .streaming, server?.active === self else { return }
         if let reply = TimingProto.handle(type: type, payload: payload) { return send(reply) }
         switch msg {
         case .hello:
@@ -425,24 +449,23 @@ final class ClientSession: @unchecked Sendable {
     }
 
     /// Tells the client this is deliberate (so it doesn't reconnect by itself), then closes.
+    /// Tells the client this is deliberate (so it doesn't reconnect by itself) and revokes the
+    /// session right away: input is released and streams stop now; the socket closes once the
+    /// goodbye has gone out.
     func sayGoodbye(_ reason: Proto.ByeReason, _ text: String, keepDisplays: Bool = false) {
         guard state != .closed else { return }
         send(Proto.message(.bye, payload: Proto.stringPayload(reason.rawValue, text)))
-        closeSoon("goodbye (\(reason))", keepDisplays: keepDisplays)
+        close(reason: "goodbye (\(reason))", keepDisplays: keepDisplays, flushFirst: true)
     }
 
-    /// Closes once queued data has gone out (or after 2 s).
+    /// Revokes now; closes the socket once queued data has gone out.
     func closeSoon(_ reason: String, keepDisplays: Bool = false) {
-        conn.send(content: nil, contentContext: .finalMessage, isComplete: true,
-                  completion: .contentProcessed { [weak self] _ in
-                      self?.queue.async { self?.close(reason: reason, keepDisplays: keepDisplays) }
-                  })
-        queue.asyncAfter(deadline: .now() + 2) { [weak self] in
-            self?.close(reason: reason, keepDisplays: keepDisplays)
-        }
+        close(reason: reason, keepDisplays: keepDisplays, flushFirst: true)
     }
 
-    func close(reason: String, keepDisplays: Bool) {
+    /// Tears the session down synchronously (input released, streams stopped, server told).
+    /// With `flushFirst`, the socket is closed after already-queued data is sent (at most 2 s).
+    func close(reason: String, keepDisplays: Bool, flushFirst: Bool = false) {
         guard state != .closed else { return }
         if state == .waitingForApproval, !pairingCode.isEmpty {
             let code = pairingCode
@@ -454,7 +477,15 @@ final class ClientSession: @unchecked Sendable {
         cursor.stop()
         heartbeat?.cancel()
         heartbeat = nil
-        conn.cancel()
+        if flushFirst {
+            // Strong captures: the connection must close even if this session is gone by then.
+            let conn = self.conn
+            conn.send(content: nil, contentContext: .finalMessage, isComplete: true,
+                      completion: .contentProcessed { _ in conn.cancel() })
+            queue.asyncAfter(deadline: .now() + 2) { conn.cancel() }
+        } else {
+            conn.cancel()
+        }
         if HostEnv.perf {
             // Close the test windows before their displays go away, so macOS never moves
             // them onto a real screen.
@@ -477,8 +508,14 @@ final class ClientSession: @unchecked Sendable {
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { [weak self] in
-            self?.send(Proto.message(.ping, payload: TimingProto.pingPayload()))
-            self?.sendLayoutIfChanged()
+            guard let self else { return }
+            if (self.state == .authorized || self.state == .streaming),
+               ProcessInfo.processInfo.systemUptime - self.lastReceived > Self.silenceLimit {
+                self.close(reason: "the PC went silent", keepDisplays: true)
+                return
+            }
+            self.send(Proto.message(.ping, payload: TimingProto.pingPayload()))
+            self.sendLayoutIfChanged()
         }
         timer.resume()
         heartbeat = timer
@@ -529,6 +566,9 @@ final class ClientSession: @unchecked Sendable {
                 },
                 audioSink: i == 0 ? { [weak self] pcm, pts in self?.sendAudio(pcm: pcm, pts: pts) } : nil,
                 reuse: reuse?[i])
+            pipeline.onCaptureFailed = { [weak self] in
+                self?.queue.async { self?.close(reason: "screen capture stopped", keepDisplays: false) }
+            }
             pipelines.append(pipeline)
 
             var info = Data()
