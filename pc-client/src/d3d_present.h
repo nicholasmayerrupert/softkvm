@@ -36,6 +36,7 @@ void d3dp_window_destroy(D3DPWindow *w);
 // Draws `frame` (AV_PIX_FMT_D3D11, or NULL to clear) scaled to the window, plus the cursor.
 int d3dp_render(D3DPWindow *w, const AVFrame *frame, const D3DPCursor *cursor);
 // Presents what d3dp_render drew. Returns 0 on success.
+/// 0 ok, -1 failed, -2 the GPU was removed/reset (every D3D object must be rebuilt).
 int d3dp_present(D3DPWindow *w);
 
 // 1 if the swap chain can take another frame without blocking (frame-latency waitable).

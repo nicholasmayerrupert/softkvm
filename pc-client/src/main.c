@@ -99,6 +99,7 @@ typedef struct {
     int dirty;  // needs a redraw (e.g. the local cursor moved)
     Uint32 last_present;
     D3DPWindow *d3d;  // zero-copy presenter (NULL: SDL renderer)
+    SDL_Rect bounds;  // the monitor's desktop rect when the window was made
     AVFrame *cur;     // frame on screen (d3d path; keeps the decoder surface alive)
 
     // stats
@@ -124,6 +125,8 @@ static SDL_atomic_t g_paused;  // disconnected on purpose: don't reconnect until
 static char g_hint_addr[64];
 static int g_hint_port;
 static SDL_atomic_t g_local_consent;  // pairing a new device: 0 asked, 1 user said yes, -1 no
+static int g_gpu_lost;        // Present reported a removed/reset GPU: relaunch to rebuild everything
+static HANDLE g_instance_mutex;
 static int g_code_asking;              // the pairing window is waiting for that answer (main thread)
 static Uint32 g_resume_mac_until;      // a drop while on the device: go back to it if we reconnect by then
 static int g_want_mac_on_connect;
@@ -565,7 +568,7 @@ static int send_hello(void) {
     // Extension: each monitor's desktop origin so the Mac can arrange its displays alike.
     uint8_t *ext = buf + 8 + g_nstreams * 12;
     for (int i = 0; i < g_nstreams; i++) {
-        SDL_Rect b;
+        SDL_Rect b = {0, 0, 0, 0};
         SDL_GetDisplayBounds(g_streams[i].monitor, &b);
         put_u32(ext + i * 8, (uint32_t)b.x);
         put_u32(ext + i * 8 + 4, (uint32_t)b.y);
@@ -1002,7 +1005,7 @@ static void render_stream_d3d(Stream *s) {
         LOG("bench: snapshot %s: %s", g_perf_snapshot, d3dp_snapshot(s->d3d, g_perf_snapshot) == 0 ? "ok" : "failed");
         g_perf_snapshot = NULL;
     }
-    d3dp_present(s->d3d);
+    if (d3dp_present(s->d3d) == -2) g_gpu_lost = 1;
     if (fresh) {
         perf_mark(idx, pts, ST_PRESENTED, perf_now_us());
         if (g_perf_gpu_wait) {
@@ -1070,8 +1073,9 @@ static void render_stream(Stream *s) {
 }
 
 static int create_window(Stream *s, int idx) {
-    SDL_Rect b;
+    SDL_Rect b = {0, 0, 0, 0};
     SDL_GetDisplayBounds(s->monitor, &b);
+    s->bounds = b;
     char title[64];
     snprintf(title, sizeof title, "SoftKVM %d", idx + 1);
     if (g_perf_bench_secs) {
@@ -1216,7 +1220,7 @@ static void set_mac_mode(int on) {
         SDL_GetGlobalMouseState(&gx, &gy);
         for (int i = 0; i < g_nstreams; i++) {
             SDL_ShowWindow(g_streams[i].win);
-            SDL_Rect b;
+            SDL_Rect b = {0, 0, 0, 0};
             SDL_GetDisplayBounds(g_streams[i].monitor, &b);
             if (gx >= b.x && gx < b.x + b.w && gy >= b.y && gy < b.y + b.h) {
                 focus = i;
@@ -1247,7 +1251,7 @@ static void set_mac_mode(int on) {
             SDL_HideWindow(g_streams[i].win);
         }
         if (d) {
-            SDL_Rect b;
+            SDL_Rect b = {0, 0, 0, 0};
             SDL_GetDisplayBounds(g_streams[cs].monitor, &b);
             SDL_WarpMouseGlobal(b.x + (int)((g_cx - d->x) / d->w * b.w), b.y + (int)((g_cy - d->y) / d->h * b.h));
         }
@@ -1320,6 +1324,46 @@ static int forward_input(const SDL_Event *ev) {
     }
 }
 
+static void stop_session(int goodbye);
+static void restart_session(void);
+
+/// True if a monitor we're showing the device on went away or moved/resized.
+static int streamed_monitors_changed(void) {
+    for (int i = 0; i < g_nstreams; i++) {
+        SDL_Rect b = {0, 0, 0, 0};
+        if (g_streams[i].monitor >= SDL_GetNumVideoDisplays() || SDL_GetDisplayBounds(g_streams[i].monitor, &b) != 0)
+            return 1;
+        if (b.x != g_streams[i].bounds.x || b.y != g_streams[i].bounds.y || b.w != g_streams[i].bounds.w ||
+            b.h != g_streams[i].bounds.h)
+            return 1;
+    }
+    return 0;
+}
+
+/// The GPU was reset (driver crash/update): every D3D object is dead. Rebuilding all of them in
+/// place is fiddly, so start a fresh copy (it reconnects, and the device keeps its displays).
+static void relaunch_after_gpu_loss(void) {
+    LOG("render: the GPU was reset; restarting SoftKVM");
+    if (g_mac_mode) set_mac_mode(0);
+    stop_session(GOODBYE_SWITCHING);  // the device keeps its displays for the new copy
+    if (g_instance_mutex) {
+        ReleaseMutex(g_instance_mutex);
+        CloseHandle(g_instance_mutex);
+        g_instance_mutex = NULL;
+    }
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    STARTUPINFOW si;
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi;
+    if (CreateProcessW(exe, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    SDL_AtomicSet(&g_quit, 1);
+}
+
 /// Ctrl + left Alt + Q / Space / 1..9 by physical key. Right Alt is excluded: on many layouts it's
 /// AltGr (= Ctrl+Alt to Windows), so AltGr+Q (@) or AltGr+7 ({) must keep typing characters.
 static int is_local_hotkey(const SDL_Keysym *k) {
@@ -1383,7 +1427,7 @@ static void refresh_pc_monitors(void) {
         PCMonitor *m = &g_pcmons[g_npcmons++];
         memset(m, 0, sizeof *m);
         snprintf(m->name, sizeof m->name, "%s", SDL_GetDisplayName(i) ? SDL_GetDisplayName(i) : "Monitor");
-        SDL_Rect b;
+        SDL_Rect b = {0, 0, 0, 0};
         SDL_GetDisplayBounds(i, &b);
         m->x = b.x;
         m->y = b.y;
@@ -2031,7 +2075,7 @@ int main(int argc, char **argv) {
     // One instance per user: a second launch just exits (benchmarks run next to the real one).
     int bench_run = 0;
     for (int i = 1; i < argc; i++) bench_run |= !strcmp(argv[i], "--bench");
-    if (!bench_run) CreateMutexW(NULL, TRUE, L"Local\\SoftKVMClient");
+    if (!bench_run) g_instance_mutex = CreateMutexW(NULL, TRUE, L"Local\\SoftKVMClient");
     if (!bench_run && GetLastError() == ERROR_ALREADY_EXISTS) {
         LOG("another SoftKVM is already running; exiting");
         return 0;
@@ -2185,13 +2229,21 @@ int main(int argc, char **argv) {
                 } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                     check_focus = 1;
                 }
-            } else if (ev.type == SDL_DISPLAYEVENT && !g_mac_mode) {
-                refresh_pc_monitors();  // monitor plugged/unplugged: refresh the menu's list
+            } else if (ev.type == SDL_DISPLAYEVENT) {
+                refresh_pc_monitors();  // monitor plugged/unplugged/rearranged
+                if (streamed_monitors_changed()) {
+                    LOG("monitors: a monitor in use changed; rebuilding the session");
+                    if (!g_cli_monitors) restart_session();
+                }
             } else if (g_mac_mode && !g_perf_bench_secs) {
                 forward_input(&ev);
             }
         } while (SDL_PollEvent(&ev));
         sync_shared_state();
+        if (g_gpu_lost && !g_perf_bench_secs) {
+            relaunch_after_gpu_loss();
+            break;
+        }
         if (g_perf_bench_secs && layout_for_stream(0)) {
             // Bench: pin the local cursor to the middle of stream 0 so cursor drawing is
             // exercised (the host reports wherever the Mac's real cursor is).

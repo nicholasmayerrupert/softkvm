@@ -426,6 +426,7 @@ int d3dp_present(D3DPWindow *w) {
     UINT sync = g_mode == D3DP_PRESENT_VSYNC ? 1 : 0;
     UINT pflags = g_mode == D3DP_PRESENT_TEARING ? DXGI_PRESENT_ALLOW_TEARING : 0;
     HRESULT hr = IDXGISwapChain2_Present(w->sc, sync, pflags);
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) return -2;  // caller must rebuild
     return FAILED(hr) ? -1 : 0;
 }
 
