@@ -25,7 +25,7 @@ One hotkey on the PC flips between "Mac mode" and "PC mode".
 
 ## Status
 
-- [ ] Milestone 1: one Mac virtual display → one PC window
+- [ ] Milestone 1: one Mac virtual display → one PC window (host verified; PC client built, untested on hardware)
 - [ ] Milestone 2: keyboard/mouse forwarding + Mac/PC hotkey
 - [ ] Milestone 3: two displays
 - [ ] Milestone 4: audio, clipboard, auto-reconnect, start on login
@@ -57,3 +57,14 @@ Client → host
 - Virtual displays use Apple's private `CGVirtualDisplay` API (same as DeskPad / BetterDisplay); a macOS update can break it.
 - The Mac app needs Screen Recording and (for input) Accessibility permission, granted once.
 - Wired Ethernet on both ends is strongly recommended.
+
+## Building
+
+**Mac host** (on the Mac): `mac-host/setup-signing.sh` once, then `mac-host/build.sh` →
+`mac-host/SoftKVMHost.app`. Grant Screen Recording on first launch.
+
+**PC client** (cross-compiled from Linux with mingw-w64): `pc-client/build.sh` → `pc-client/dist/`
+(`softkvm.exe` + DLLs). Run `softkvm.exe <mac-ip> [--monitor N]`.
+
+**Test without a PC**: `python3 tools/recv.py <mac-ip> --seconds 10` dumps the stream to
+`tools/out/stream0.h265`.
