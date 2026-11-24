@@ -97,6 +97,8 @@ static void show_menu(void) {
 
     if (st.connected)
         snprintf(buf, sizeof buf, "Connected to %s", st.host_name[0] ? st.host_name : "Mac");
+    else if (st.paused)
+        snprintf(buf, sizeof buf, "Disconnected from %s", st.host_name[0] ? st.host_name : "the Mac");
     else if (st.host_addr[0])
         snprintf(buf, sizeof buf, "Connecting to %s…", st.host_addr);
     else
@@ -104,8 +106,11 @@ static void show_menu(void) {
     add_item(m, 1, buf, 0, 0);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
-    add_item(m, MENU_ID(CMD_TOGGLE_MODE, 0),
-             st.mac_mode ? "Switch to PC\tCtrl+Alt+Space" : "Switch to Mac\tCtrl+Alt+Space", 0, st.connected);
+    if (st.paused)
+        add_item(m, MENU_ID(CMD_RECONNECT, 0), "Reconnect\tCtrl+Alt+Space", 0, 1);
+    else
+        add_item(m, MENU_ID(CMD_TOGGLE_MODE, 0),
+                 st.mac_mode ? "Switch to PC\tCtrl+Alt+Space" : "Switch to Mac\tCtrl+Alt+Space", 0, st.connected);
 
     // Monitors: each checked monitor shows one Mac display. At least one must stay on.
     HMENU mons = CreatePopupMenu();

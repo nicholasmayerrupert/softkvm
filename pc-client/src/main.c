@@ -49,6 +49,7 @@ enum {
     MSG_CURSOR = 0x07,
     MSG_CURSOR_POS = 0x08,
     MSG_SET_MONITORS = 0x09,
+    MSG_BYE = 0x0A,
     MSG_HELLO = 0x81,
     MSG_KEYFRAME_REQUEST = 0x82,
     MSG_MONITORS = 0x83,
@@ -98,6 +99,8 @@ static SDL_Thread *g_net_thread;
 static SDL_atomic_t g_net_stop;
 static SDL_atomic_t g_connected;
 static SDL_atomic_t g_session_gen;
+static SDL_atomic_t g_paused;  // the Mac said goodbye: don't reconnect until the user asks
+static int g_want_mac_on_connect;
 static char g_net_host_name[128];  // the Mac's name (g_shared_lock)
 static Uint32 g_cmd_event;
 
@@ -514,7 +517,7 @@ static int net_thread(void *unused) {
         snprintf(host, sizeof host, "%s", g_cfg.host);
         port = g_cfg.port;
         SDL_UnlockMutex(g_shared_lock);
-        if (!host[0]) {  // no Mac chosen yet: discovery will fill one in
+        if (!host[0] || SDL_AtomicGet(&g_paused)) {  // no Mac chosen yet, or disconnected on purpose
             net_sleep(500);
             continue;
         }
@@ -565,6 +568,10 @@ static int net_thread(void *unused) {
                 post_status(1, gen);
                 break;
             }
+            case MSG_BYE:
+                LOG("net: the Mac disconnected us; not reconnecting until asked");
+                SDL_AtomicSet(&g_paused, 1);
+                goto disconnected;
             case MSG_SET_MONITORS:
                 if (len >= 4) app_post_command(CMD_SET_MONITOR_MASK, (int)get_u32(buf));
                 break;
@@ -1126,6 +1133,7 @@ void app_snapshot(AppSnapshot *out) {
     out->pc_style_modifiers = g_pc_style_modifiers;
     out->autostart = autostart_enabled();
     out->searching = SDL_AtomicGet(&g_searching);
+    out->paused = SDL_AtomicGet(&g_paused);
     out->nmonitors = g_npcmons;
     for (int i = 0; i < g_npcmons && i < APP_MAX_MONITORS; i++) {
         snprintf(out->monitors[i].name, sizeof out->monitors[i].name, "%s", g_pcmons[i].name);
@@ -1179,13 +1187,25 @@ static void update_tray(void) {
     app_snapshot(&st);
     char tip[128];
     if (st.connected) snprintf(tip, sizeof tip, "SoftKVM — %s (%s)", st.host_name, st.mac_mode ? "on the Mac" : "on the PC");
+    else if (st.paused) snprintf(tip, sizeof tip, "SoftKVM — disconnected (Ctrl+Alt+Space to reconnect)");
     else snprintf(tip, sizeof tip, "SoftKVM — %s", st.host_addr[0] ? "connecting…" : "looking for a Mac…");
     tray_set_status(st.connected, tip);
 }
 
 static void handle_command(int cmd, int arg, int gen) {
     switch (cmd) {
+    case CMD_RECONNECT:
+        if (SDL_AtomicGet(&g_paused)) {
+            LOG("net: reconnecting at the user's request");
+            SDL_AtomicSet(&g_paused, 0);
+            g_want_mac_on_connect = 1;
+        }
+        break;
     case CMD_TOGGLE_MODE:
+        if (!g_mac_mode && SDL_AtomicGet(&g_paused)) {  // the hotkey also reconnects
+            handle_command(CMD_RECONNECT, 0, 0);
+            return;
+        }
         if (!g_mac_mode && !SDL_AtomicGet(&g_connected)) {
             LOG("mode: not connected to a Mac; staying on the PC");
             break;
@@ -1349,7 +1369,7 @@ int main(int argc, char **argv) {
     // Start on the PC; switch to the Mac once connected (unless started hidden).
     g_mac_mode = 0;
     start_session();
-    int want_mac_on_connect = !g_start_hidden;
+    g_want_mac_on_connect = !g_start_hidden;
     start_discovery();
     update_tray();
 
@@ -1364,9 +1384,9 @@ int main(int argc, char **argv) {
                 SDL_AtomicSet(&g_quit, 1);
             } else if (ev.type == g_cmd_event) {
                 int cmd = ev.user.code, arg = (int)(intptr_t)ev.user.data1, gen = (int)(intptr_t)ev.user.data2;
-                if (cmd == CMD_INTERNAL_STATUS && arg && want_mac_on_connect &&
+                if (cmd == CMD_INTERNAL_STATUS && arg && g_want_mac_on_connect &&
                     gen == SDL_AtomicGet(&g_session_gen)) {
-                    want_mac_on_connect = 0;
+                    g_want_mac_on_connect = 0;
                     g_mac_mode = 1;  // handle_command shows the Mac windows
                 }
                 handle_command(cmd, arg, gen);

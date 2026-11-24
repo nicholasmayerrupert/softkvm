@@ -25,6 +25,8 @@ enum Proto {
         case cursor = 0x07
         case cursorPos = 0x08
         case setMonitors = 0x09
+        /// Deliberate disconnect: the client should not reconnect until its user asks.
+        case bye = 0x0A
         // client -> host
         case hello = 0x81
         case keyframeRequest = 0x82

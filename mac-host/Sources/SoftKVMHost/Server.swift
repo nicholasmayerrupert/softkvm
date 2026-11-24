@@ -31,7 +31,7 @@ final class Server: @unchecked Sendable {
     }
 
     func disconnect() {
-        queue.async { self.session?.close(reason: "disconnected from the menu") }
+        queue.async { self.session?.sayGoodbye() }
     }
 
     func start() throws {
@@ -141,6 +141,15 @@ final class ClientSession: @unchecked Sendable {
         }
         timer.resume()
         heartbeat = timer
+    }
+
+    /// Tells the client this is deliberate (so it stays disconnected), then closes.
+    func sayGoodbye() {
+        guard !closed else { return }
+        let data = Proto.message(.bye)
+        conn.send(content: data, completion: .contentProcessed { [weak self] _ in
+            self?.queue.async { self?.close(reason: "disconnected from the menu") }
+        })
     }
 
     func close(reason: String) {

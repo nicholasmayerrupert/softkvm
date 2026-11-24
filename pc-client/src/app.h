@@ -24,6 +24,7 @@ typedef struct {
     int pc_style_modifiers;
     int autostart;
     int searching;
+    int paused;  // the Mac disconnected us on purpose; waiting for the user to reconnect
     int nmonitors;
     AppMonitor monitors[APP_MAX_MONITORS];
     int nhosts;
@@ -40,6 +41,7 @@ enum {
     CMD_SEARCH,
     CMD_QUIT,
     CMD_SET_MONITOR_MASK,  // arg = bitmask (from the Mac's menu)
+    CMD_RECONNECT,
 };
 
 void app_snapshot(AppSnapshot *out);

@@ -48,6 +48,7 @@ Host → client
 | `0x06` | LAYOUT | `u32 n`, then n × `u8 stream (0xFF = not streamed), u8[3], i32 x, y, w, h` — every Mac display in global points |
 | `0x07` | CURSOR | `i32 hot_x, hot_y, u32 w, h`, then w×h RGBA (straight alpha) — sent when the cursor shape changes |
 | `0x09` | SET_MONITORS | `u32 mask` — the Mac's menu asks the PC to use these monitors (bit i = monitor i); the PC reconnects |
+| `0x0A` | BYE | (empty) deliberate disconnect from the Mac's menu; the client stays disconnected until its user reconnects |
 | `0x08` | CURSOR_POS | `f32 x, y` global points — when something other than the client moved the cursor |
 | `0x04` | AUDIO | `u64 pts_us`, then s16le stereo PCM @ 48 kHz (system audio) |
 
