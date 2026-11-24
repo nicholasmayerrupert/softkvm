@@ -97,7 +97,8 @@ final class Server: @unchecked Sendable {
                     if allowed {
                         TrustStore.shared.add(name: s.clientName, key: s.clientKey)
                         Log.info("server: paired with \(s.clientName)")
-                        self.admit(s, code: .paired)
+                        s.sendAuth(.paired, "")  // informational: the client remembers this Mac
+                        self.admit(s, code: .ok)
                     } else {
                         Log.info("server: pairing with \(s.clientName) denied")
                         s.sendAuth(.pairingDenied, "")
@@ -115,7 +116,6 @@ final class Server: @unchecked Sendable {
                 a.close(reason: "replaced by the same PC reconnecting", keepDisplays: true)
             } else {
                 Log.info("server: \(s.clientName) is waiting; \(a.clientName) is in control")
-                if code == .paired { s.sendAuth(.paired, "") }  // so it remembers this Mac
                 s.state = .busy
                 s.sendAuth(.busy, a.clientName)
                 return

@@ -48,7 +48,7 @@ enum Proto {
         case pairingPending = 1   // waiting for the user to approve on the Mac (compare the code)
         case pairingDenied = 2
         case busy = 3             // text = the PC currently in control; send TAKEOVER to take over
-        case paired = 4           // just approved; remember this Mac, then send HELLO
+        case paired = 4           // just approved (informational; OK or BUSY follows)
     }
 
     enum ByeReason: UInt8 {

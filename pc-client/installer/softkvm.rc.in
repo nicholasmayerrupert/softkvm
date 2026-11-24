@@ -1,0 +1,29 @@
+#include <winver.h>
+
+1 ICON "@ICON@"
+1 24 "@MANIFEST@"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @V1@,@V2@,@V3@,0
+ PRODUCTVERSION @V1@,@V2@,@V3@,0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "SoftKVM"
+      VALUE "FileDescription", "SoftKVM - control your other computers from this PC"
+      VALUE "FileVersion", "@VERSION@"
+      VALUE "InternalName", "softkvm"
+      VALUE "OriginalFilename", "softkvm.exe"
+      VALUE "ProductName", "SoftKVM"
+      VALUE "ProductVersion", "@VERSION@"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

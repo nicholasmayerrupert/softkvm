@@ -12,6 +12,11 @@ cp .build/release/SoftKVMHost "$APP/Contents/MacOS/"
 cp Resources/Info.plist "$APP/Contents/"
 VERSION=$(cat ../VERSION 2>/dev/null || echo 0.0.0)
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+if [ -d ../assets/AppIcon.iconset ]; then
+  mkdir -p "$APP/Contents/Resources"
+  iconutil -c icns ../assets/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string AppIcon" "$APP/Contents/Info.plist"
+fi
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(git -C .. rev-list --count HEAD 2>/dev/null || echo 1)" "$APP/Contents/Info.plist"
 
 KC="$HOME/Library/Keychains/softkvm-signing.keychain-db"

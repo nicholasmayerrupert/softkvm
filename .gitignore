@@ -17,3 +17,6 @@ tools/out/
 
 # Python
 __pycache__/
+pc-client/dist-installer/
+pc-client/build/
+mac-host/dist/
