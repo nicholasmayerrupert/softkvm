@@ -443,6 +443,10 @@ final class ClientSession: @unchecked Sendable {
 
     func close(reason: String, keepDisplays: Bool) {
         guard state != .closed else { return }
+        if state == .waitingForApproval, !pairingCode.isEmpty {
+            let code = pairingCode
+            PairingPrompt.cancel(code: code)  // nobody left to approve
+        }
         state = .closed
         Log.info("session: \(clientName) closed (\(reason))")
         injector.releaseAll()

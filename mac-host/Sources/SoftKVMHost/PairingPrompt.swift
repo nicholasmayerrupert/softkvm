@@ -2,6 +2,15 @@ import AppKit
 
 /// Asks the user whether a new PC may control this Mac.
 enum PairingPrompt {
+    /// Codes whose PC went away while their prompt was up (any thread).
+    private static let lock = NSLock()
+    private static var cancelled = Set<String>()
+
+    /// Closes the prompt for `code` if it's still up (the PC that asked went away).
+    static func cancel(code: String) {
+        lock.lock(); cancelled.insert(code); lock.unlock()
+    }
+
     static func ask(name: String, code: String, reply: @escaping (Bool) -> Void) {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
@@ -17,7 +26,16 @@ enum PairingPrompt {
         // "Don't Allow" is the default button, so an accidental Return can't approve a stranger.
         alert.addButton(withTitle: "Don't Allow")
         alert.addButton(withTitle: "Allow")
-        reply(alert.runModal() == .alertSecondButtonReturn)
+        // The modal loop only runs timers scheduled for modal-panel mode; poll for cancellation there.
+        let watcher = Timer(timeInterval: 0.25, repeats: true) { _ in
+            lock.lock(); let gone = cancelled.remove(code) != nil; lock.unlock()
+            if gone { NSApp.abortModal() }
+        }
+        RunLoop.main.add(watcher, forMode: .modalPanel)
+        let response = alert.runModal()
+        watcher.invalidate()
+        lock.lock(); cancelled.remove(code); lock.unlock()
+        reply(response == .alertSecondButtonReturn)
     }
 
     static func confirmForget(name: String) -> Bool {
