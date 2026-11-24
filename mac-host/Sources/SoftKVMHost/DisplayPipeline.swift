@@ -4,6 +4,14 @@ import CoreMedia
 import Foundation
 import ScreenCaptureKit
 
+/// A live virtual display that outlives a session (kept so windows don't get rearranged
+/// when a PC reconnects). Releasing `object` removes the display.
+struct VirtualDisplayHandle {
+    let object: AnyObject
+    let id: CGDirectDisplayID
+    let request: Proto.DisplayRequest
+}
+
 /// One virtual display -> ScreenCaptureKit capture -> hardware encoder -> sink.
 final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     typealias Sink = (_ annexB: Data, _ keyframe: Bool, _ ptsMicros: UInt64) -> Void
@@ -38,8 +46,11 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
     private var statsStart = CFAbsoluteTimeGetCurrent()
 
     /// Pass `audioSink` on exactly one pipeline: system audio is global, not per display.
+    private let reuse: VirtualDisplayHandle?
+
     init(index: Int, request: Proto.DisplayRequest, bitrate: Int, sink: @escaping Sink,
-         audioSink: AudioSink? = nil) {
+         audioSink: AudioSink? = nil, reuse: VirtualDisplayHandle? = nil) {
+        self.reuse = reuse
         self.index = index
         self.request = request
         self.bitrate = bitrate
@@ -53,19 +64,27 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         let w = Int(request.width), h = Int(request.height), fps = Int(request.fps)
 
         let index = self.index
-        let (created, id): (AnyObject?, CGDirectDisplayID) = await MainActor.run {
-            var id: CGDirectDisplayID = 0
-            let obj = SKCreateVirtualDisplay("SoftKVM \(index + 1)", UInt32(w), UInt32(h), Double(fps),
-                                             UInt32(index + 1), &id) as AnyObject?
-            return (obj, id)
+        let id: CGDirectDisplayID
+        if let reuse {
+            virtualDisplay = reuse.object
+            id = reuse.id
+            Log.info("display \(index): reusing virtual display id=\(id) \(w)x\(h)@\(fps)")
+        } else {
+            let (created, newID): (AnyObject?, CGDirectDisplayID) = await MainActor.run {
+                var id: CGDirectDisplayID = 0
+                let obj = SKCreateVirtualDisplay("SoftKVM \(index + 1)", UInt32(w), UInt32(h), Double(fps),
+                                                 UInt32(index + 1), &id) as AnyObject?
+                return (obj, id)
+            }
+            guard let created, newID != 0 else {
+                throw NSError(domain: "SoftKVM", code: 1,
+                              userInfo: [NSLocalizedDescriptionKey: "could not create virtual display"])
+            }
+            virtualDisplay = created
+            id = newID
+            Log.info("display \(index): created virtual display id=\(id) \(w)x\(h)@\(fps)")
         }
-        guard let created, id != 0 else {
-            throw NSError(domain: "SoftKVM", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "could not create virtual display"])
-        }
-        virtualDisplay = created
         displayID = id
-        Log.info("display \(index): created virtual display id=\(id) \(w)x\(h)@\(fps)")
 
         // The new display shows up in ScreenCaptureKit asynchronously.
         var scDisplay: SCDisplay?
@@ -118,7 +137,9 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         refreshTimer = timer
     }
 
-    func stop() {
+    /// Stops capture. With `keepDisplay`, returns the virtual display instead of removing it.
+    @discardableResult
+    func stop(keepDisplay: Bool = false) -> VirtualDisplayHandle? {
         refreshTimer?.cancel()
         refreshTimer = nil
         let stream = self.stream
@@ -129,10 +150,16 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
             encoder = nil
             lastBuffer = nil
         }
-        // Releasing the object removes the virtual display.
-        DispatchQueue.main.async { [virtualDisplay] in _ = virtualDisplay }
+        var kept: VirtualDisplayHandle?
+        if keepDisplay, let obj = virtualDisplay, displayID != 0 {
+            kept = VirtualDisplayHandle(object: obj, id: displayID, request: request)
+        } else {
+            // Releasing the object removes the virtual display.
+            DispatchQueue.main.async { [virtualDisplay] in _ = virtualDisplay }
+        }
         virtualDisplay = nil
-        Log.info("display \(index): stopped")
+        Log.info("display \(index): stopped\(kept != nil ? " (display kept)" : "")")
+        return kept
     }
 
     func setBitrate(_ bitrate: Int) {

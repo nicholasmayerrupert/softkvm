@@ -10,6 +10,9 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 cp .build/release/SoftKVMHost "$APP/Contents/MacOS/"
 cp Resources/Info.plist "$APP/Contents/"
+VERSION=$(cat ../VERSION 2>/dev/null || echo 0.0.0)
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $(git -C .. rev-list --count HEAD 2>/dev/null || echo 1)" "$APP/Contents/Info.plist"
 
 KC="$HOME/Library/Keychains/softkvm-signing.keychain-db"
 if [ -f "$KC" ]; then

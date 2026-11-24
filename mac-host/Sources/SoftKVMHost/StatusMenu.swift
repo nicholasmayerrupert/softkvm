@@ -65,7 +65,23 @@ final class StatusMenu: NSObject, NSMenuDelegate {
             }
         }
 
+        // Paired PCs, each with a Forget option.
+        let paired = TrustStore.shared.all
+        let pairedItem = NSMenuItem(title: "Paired PCs (\(paired.count))", action: nil, keyEquivalent: "")
+        let pairedMenu = NSMenu()
+        if paired.isEmpty {
+            pairedMenu.addItem(info("None yet — run SoftKVM on a PC to pair it"))
+        }
+        for (i, p) in paired.enumerated() {
+            let connected = state.clientName != nil && p.name == state.clientName
+            let mi = action("Forget \(p.name)\(connected ? " (connected)" : "")…", #selector(forgetPC(_:)))
+            mi.tag = i
+            pairedMenu.addItem(mi)
+        }
+        pairedItem.submenu = pairedMenu
+
         menu.addItem(.separator())
+        menu.addItem(pairedItem)
         let quality = NSMenuItem(title: "Video quality", action: nil, keyEquivalent: "")
         let qualityMenu = NSMenu()
         for q in AppState.videoQualities {
@@ -98,6 +114,8 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
         menu.addItem(action("Open Log", #selector(openLog)))
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+        menu.addItem(info("Version \(version) · device \(deviceID(Identity.publicKey))"))
 
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit SoftKVM Host", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -143,6 +161,13 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     @objc private func disconnect() { server.disconnect() }
+
+    @objc private func forgetPC(_ sender: NSMenuItem) {
+        let paired = TrustStore.shared.all
+        guard sender.tag < paired.count else { return }
+        let pc = paired[sender.tag]
+        if PairingPrompt.confirmForget(name: pc.name) { server.unpair(key: pc.publicKey) }
+    }
 
     @objc private func openScreenRecordingSettings() {
         CGRequestScreenCaptureAccess()

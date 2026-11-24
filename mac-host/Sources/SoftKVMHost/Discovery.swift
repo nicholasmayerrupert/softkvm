@@ -2,7 +2,8 @@ import Darwin
 import Foundation
 
 /// Answers LAN discovery broadcasts so PCs can find this Mac without typing an address.
-/// Request: "SOFTKVM_DISCOVER". Reply: "SOFTKVM_HOST" + u16 LE TCP port + UTF-8 name.
+/// Request: "SOFTKVM_DISCOVER". Reply: "SOFTKVM_HOST", u16 TCP port, u16 protocol version,
+/// u8 platform, 32-byte public key (identifies the device across address changes), u8 len, UTF-8 name.
 final class DiscoveryResponder {
     private var fd: Int32 = -1
     private let queue = DispatchQueue(label: "softkvm.discovery")
@@ -56,7 +57,12 @@ final class DiscoveryResponder {
 
         var reply = Data(Proto.discoverReply)
         reply.appendLE(Proto.port)
-        reply.append(Data(name().utf8.prefix(64)))
+        reply.appendLE(Handshake.protocolVersion)
+        reply.append(Handshake.Platform.mac.rawValue)
+        reply.append(Identity.publicKey)
+        let nameBytes = Array(name().utf8.prefix(64))
+        reply.append(UInt8(nameBytes.count))
+        reply.append(contentsOf: nameBytes)
         _ = reply.withUnsafeBytes { bytes in
             withUnsafePointer(to: &from) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {

@@ -8,3 +8,8 @@ void tray_set_status(int connected, const char *tooltip);
 void tray_shutdown(void);
 /// 1 if Ctrl+Alt+Space was registered globally.
 int tray_hotkey_registered(void);
+/// Balloon notification from the tray icon.
+void tray_notify(const char *title, const char *text);
+/// Shows (or replaces) a window with the pairing code to compare on the device.
+void tray_show_code(const char *device, const char *code);
+void tray_hide_code(void);

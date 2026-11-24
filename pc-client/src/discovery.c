@@ -76,16 +76,22 @@ int discovery_run(AppHost *out, int max, int timeout_ms) {
         struct sockaddr_in from;
         int fromlen = sizeof from;
         int len = recvfrom(s, buf, sizeof buf - 1, 0, (struct sockaddr *)&from, &fromlen);
+        // "SOFTKVM_HOST", u16 port, u16 protocol, u8 platform, 32-byte key, u8 len, name
         int rl = (int)strlen(REPLY);
-        if (len < rl + 2 || memcmp(buf, REPLY, rl) != 0) continue;
+        if (len < rl + 2 + 2 + 1 + 32 + 1 || memcmp(buf, REPLY, rl) != 0) continue;
+        const unsigned char *p = (const unsigned char *)buf + rl;
         AppHost h = {0};
-        h.port = (unsigned char)buf[rl] | (unsigned char)buf[rl + 1] << 8;
-        int name_len = len - rl - 2;
+        h.port = p[0] | p[1] << 8;
+        h.proto = p[2] | p[3] << 8;
+        h.platform = p[4];
+        memcpy(h.pub, p + 5, 32);
+        int name_len = p[37];
+        if (name_len > len - rl - 38) name_len = len - rl - 38;
         if (name_len > (int)sizeof h.name - 1) name_len = sizeof h.name - 1;
-        memcpy(h.name, buf + rl + 2, name_len);
+        memcpy(h.name, p + 38, name_len);
         inet_ntop(AF_INET, &from.sin_addr, h.addr, sizeof h.addr);
         int dup = 0;
-        for (int i = 0; i < n; i++) dup |= !strcmp(out[i].addr, h.addr);
+        for (int i = 0; i < n; i++) dup |= !memcmp(out[i].pub, h.pub, 32);
         if (!dup && n < max) out[n++] = h;
     }
     closesocket(s);

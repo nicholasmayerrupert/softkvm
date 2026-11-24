@@ -13,6 +13,7 @@
 #define WM_TRAY (WM_APP + 1)
 #define TRAY_UID 1
 #define HOTKEY_ID 1
+#define HOTKEY_DEVICE_BASE 11
 // Menu ids: 1000 + cmd * 100 + arg
 #define MENU_ID(cmd, arg) (1000 + (cmd) * 100 + (arg))
 
@@ -84,67 +85,94 @@ static void utf8_to_wide(const char *s, wchar_t *out, int n) {
 }
 
 static void add_item(HMENU m, UINT id, const char *text, int checked, int enabled) {
-    wchar_t w[256];
-    utf8_to_wide(text, w, 256);
+    wchar_t w[300];
+    utf8_to_wide(text, w, 300);
     AppendMenuW(m, MF_STRING | (checked ? MF_CHECKED : 0) | (enabled ? 0 : MF_GRAYED), id, w);
+}
+
+static void add_submenu(HMENU m, HMENU sub, const char *text) {
+    wchar_t w[300];
+    utf8_to_wide(text, w, 300);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, w);
+}
+
+static const char *device_state_text(const AppDevice *d, int is_active, int mac_mode, char *buf, size_t n) {
+    switch (d->state) {
+    case DEV_CONNECTED: return is_active && mac_mode ? "in control" : "connected";
+    case DEV_ONLINE: return "online";
+    case DEV_CONNECTING: return "connecting…";
+    case DEV_PAIRING: snprintf(buf, n, "approve on the Mac — code %s", d->status); return buf;
+    case DEV_BUSY: snprintf(buf, n, "in use by %s — click to take over", d->status); return buf;
+    case DEV_PAUSED: snprintf(buf, n, "%s — click to reconnect", d->status); return buf;
+    case DEV_ERROR: return d->status;
+    default: return "offline";
+    }
 }
 
 static void show_menu(void) {
     AppSnapshot st;
     app_snapshot(&st);
     HMENU m = CreatePopupMenu();
-    char buf[256];
+    char buf[300], sbuf[200];
 
-    if (st.connected)
-        snprintf(buf, sizeof buf, "Connected to %s", st.host_name[0] ? st.host_name : "Mac");
-    else if (st.paused)
-        snprintf(buf, sizeof buf, "Disconnected from %s", st.host_name[0] ? st.host_name : "the Mac");
-    else if (st.host_addr[0])
-        snprintf(buf, sizeof buf, "Connecting to %s…", st.host_addr);
-    else
-        snprintf(buf, sizeof buf, "Looking for a Mac…");
+    snprintf(buf, sizeof buf, "SoftKVM %s", st.version);
     add_item(m, 1, buf, 0, 0);
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
-    if (st.paused)
-        add_item(m, MENU_ID(CMD_RECONNECT, 0), "Reconnect\tCtrl+Alt+Space", 0, 1);
-    else
-        add_item(m, MENU_ID(CMD_TOGGLE_MODE, 0),
-                 st.mac_mode ? "Switch to PC\tCtrl+Alt+Space" : "Switch to Mac\tCtrl+Alt+Space", 0, st.connected);
+    // Devices: click to control. Ctrl+Alt+N jumps straight to device N.
+    if (st.ndevices == 0) add_item(m, 1, "No devices yet — add one below", 0, 0);
+    for (int i = 0; i < st.ndevices; i++) {
+        AppDevice *d = &st.devices[i];
+        const char *state = device_state_text(d, i == st.active, st.mac_mode, sbuf, sizeof sbuf);
+        if (i < 9) snprintf(buf, sizeof buf, "%s — %s\tCtrl+Alt+%d", d->name, state, i + 1);
+        else snprintf(buf, sizeof buf, "%s — %s", d->name, state);
+        add_item(m, MENU_ID(CMD_SELECT_DEVICE, i), buf, i == st.active, d->state != DEV_OFFLINE || i == st.active);
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
 
-    // Monitors: each checked monitor shows one Mac display. At least one must stay on.
-    HMENU mons = CreatePopupMenu();
-    int selected = 0;
-    for (int i = 0; i < st.nmonitors; i++) selected += st.monitors[i].selected;
-    for (int i = 0; i < st.nmonitors; i++) {
-        AppMonitor *mo = &st.monitors[i];
-        snprintf(buf, sizeof buf, "%s — %d×%d", mo->name, mo->w, mo->h);
-        add_item(mons, MENU_ID(CMD_TOGGLE_MONITOR, i), buf, mo->selected, !(mo->selected && selected == 1));
-    }
-    snprintf(buf, sizeof buf, "Mac displays (%d of %d monitors)", selected, st.nmonitors);
-    wchar_t wbuf[256];
-    utf8_to_wide(buf, wbuf, 256);
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)mons, wbuf);
+    int connected = st.active >= 0 && st.devices[st.active].state == DEV_CONNECTED;
+    if (st.active >= 0) {
+        snprintf(buf, sizeof buf, st.mac_mode ? "Switch to this PC\tCtrl+Alt+Space" : "Switch to %s\tCtrl+Alt+Space",
+                 st.devices[st.active].name);
+        add_item(m, MENU_ID(CMD_TOGGLE_MODE, 0), buf, 0, connected || st.mac_mode);
 
-    // Which Mac to connect to.
-    HMENU macs = CreatePopupMenu();
-    for (int i = 0; i < st.nhosts; i++) {
-        snprintf(buf, sizeof buf, "%s (%s)", st.hosts[i].name, st.hosts[i].addr);
-        add_item(macs, MENU_ID(CMD_SELECT_HOST, i), buf, !strcmp(st.hosts[i].addr, st.host_addr), 1);
+        // Which PC monitors show this device. At least one must stay on.
+        HMENU mons = CreatePopupMenu();
+        int selected = 0;
+        for (int i = 0; i < st.nmonitors; i++) selected += st.monitors[i].selected;
+        for (int i = 0; i < st.nmonitors; i++) {
+            AppMonitor *mo = &st.monitors[i];
+            snprintf(buf, sizeof buf, "%s — %d×%d", mo->name, mo->w, mo->h);
+            add_item(mons, MENU_ID(CMD_TOGGLE_MONITOR, i), buf, mo->selected, !(mo->selected && selected == 1));
+        }
+        snprintf(buf, sizeof buf, "Monitors for %s (%d of %d)", st.devices[st.active].name, selected, st.nmonitors);
+        add_submenu(m, mons, buf);
     }
-    if (st.nhosts == 0 && st.host_addr[0]) {
-        snprintf(buf, sizeof buf, "%s (%s)", st.host_name[0] ? st.host_name : "Mac", st.host_addr);
-        add_item(macs, 1, buf, 1, 0);
+
+    HMENU add = CreatePopupMenu();
+    for (int i = 0; i < st.navailable; i++) {
+        snprintf(buf, sizeof buf, "%s (%s)%s", st.available[i].name, st.available[i].addr,
+                 st.available[i].proto != 1 ? " — different version" : "");
+        add_item(add, MENU_ID(CMD_ADD_DEVICE, i), buf, 0, st.available[i].proto == 1);
     }
-    if (st.nhosts == 0 && !st.host_addr[0]) add_item(macs, 1, "No Macs found yet", 0, 0);
-    AppendMenuW(macs, MF_SEPARATOR, 0, NULL);
-    add_item(macs, MENU_ID(CMD_SEARCH, 0), st.searching ? "Searching…" : "Search again", 0, !st.searching);
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)macs, L"Mac");
+    if (st.navailable == 0) add_item(add, 1, st.searching ? "Searching…" : "No new devices found", 0, 0);
+    AppendMenuW(add, MF_SEPARATOR, 0, NULL);
+    add_item(add, MENU_ID(CMD_SEARCH, 0), "Search again", 0, !st.searching);
+    add_submenu(m, add, "Add a device");
+
+    if (st.ndevices > 0) {
+        HMENU forget = CreatePopupMenu();
+        for (int i = 0; i < st.ndevices; i++) {
+            snprintf(buf, sizeof buf, "%s…", st.devices[i].name);
+            add_item(forget, MENU_ID(CMD_FORGET_DEVICE, i), buf, 0, 1);
+        }
+        add_submenu(m, forget, "Forget a device");
+    }
 
     HMENU keys = CreatePopupMenu();
     add_item(keys, MENU_ID(CMD_SET_MODIFIERS, 1), "PC style: Ctrl acts as Cmd (Ctrl+C copies)", st.pc_style_modifiers, 1);
     add_item(keys, MENU_ID(CMD_SET_MODIFIERS, 0), "Mac style: Windows key acts as Cmd", !st.pc_style_modifiers, 1);
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)keys, L"Keyboard");
+    add_submenu(m, keys, "Keyboard");
 
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     add_item(m, MENU_ID(CMD_TOGGLE_AUTOSTART, 0), "Start with Windows", st.autostart, 1);
@@ -159,6 +187,43 @@ static void show_menu(void) {
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);  // destroys submenus too
     if (id >= 1000) app_post_command((id - 1000) / 100, (id - 1000) % 100);
+}
+
+// ---------------------------------------------------------------------------
+// Notifications and the pairing-code window
+
+void tray_notify(const char *title, const char *text) {
+    if (!g_hwnd) return;
+    NOTIFYICONDATAW n = g_nid;
+    n.uFlags = NIF_INFO;
+    utf8_to_wide(title, n.szInfoTitle, 64);
+    utf8_to_wide(text, n.szInfo, 256);
+    n.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
+static const wchar_t *CODE_TITLE = L"SoftKVM — pairing";
+static wchar_t g_code_text[512];
+
+static DWORD WINAPI code_box_thread(LPVOID unused) {
+    (void)unused;
+    MessageBoxW(NULL, g_code_text, CODE_TITLE, MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST);
+    return 0;
+}
+
+void tray_show_code(const char *device, const char *code) {
+    tray_hide_code();
+    char text[512];
+    snprintf(text, sizeof text,
+             "Approve this PC on “%s”.\n\nCheck that it shows the same code:\n\n        %s\n\n"
+             "This closes by itself once you approve.", device, code);
+    utf8_to_wide(text, g_code_text, 512);
+    CloseHandle(CreateThread(NULL, 0, code_box_thread, NULL, 0, NULL));
+}
+
+void tray_hide_code(void) {
+    HWND box = FindWindowW(L"#32770", CODE_TITLE);
+    if (box) PostMessageW(box, WM_CLOSE, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +243,10 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_HOTKEY && wp == HOTKEY_ID) {
         app_post_command(CMD_TOGGLE_MODE, 0);
+        return 0;
+    }
+    if (msg == WM_HOTKEY && wp >= HOTKEY_DEVICE_BASE && wp < HOTKEY_DEVICE_BASE + 9) {
+        app_post_command(CMD_SELECT_DEVICE, (int)(wp - HOTKEY_DEVICE_BASE));
         return 0;
     }
     if (msg == g_taskbar_created && g_taskbar_created) {  // Explorer restarted
@@ -213,6 +282,8 @@ int tray_init(void) {
     add_icon();
 
     g_hotkey_ok = RegisterHotKey(g_hwnd, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE) != 0;
+    for (int i = 0; i < 9; i++)  // Ctrl+Alt+1..9: jump to device N
+        RegisterHotKey(g_hwnd, HOTKEY_DEVICE_BASE + i, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, '1' + i);
     return 0;
 }
 
@@ -234,6 +305,8 @@ void tray_set_status(int connected, const char *tooltip) {
 void tray_shutdown(void) {
     if (!g_hwnd) return;
     UnregisterHotKey(g_hwnd, HOTKEY_ID);
+    for (int i = 0; i < 9; i++) UnregisterHotKey(g_hwnd, HOTKEY_DEVICE_BASE + i);
+    tray_hide_code();
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     DestroyWindow(g_hwnd);
     g_hwnd = NULL;

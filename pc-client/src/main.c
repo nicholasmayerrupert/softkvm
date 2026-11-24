@@ -30,11 +30,15 @@
 #include "config.h"
 #include "discovery.h"
 #include "keymap.h"
+#include "secure.h"
 #include "tray.h"
 
 #include <shellapi.h>
 
-#define PROTO_VERSION 0
+#ifndef SOFTKVM_VERSION
+#define SOFTKVM_VERSION "dev"
+#endif
+#define PROTO_VERSION SK_PROTO_VERSION
 #define DEFAULT_PORT 47900
 #define MAX_STREAMS 4
 #define MAX_PAYLOAD (64 * 1024 * 1024)
@@ -50,13 +54,19 @@ enum {
     MSG_CURSOR_POS = 0x08,
     MSG_SET_MONITORS = 0x09,
     MSG_BYE = 0x0A,
+    MSG_AUTH_STATUS = 0x0B,
     MSG_HELLO = 0x81,
     MSG_KEYFRAME_REQUEST = 0x82,
     MSG_MONITORS = 0x83,
+    MSG_TAKEOVER = 0x84,
+    MSG_GOODBYE = 0x85,
     MSG_INPUT = 0x90,
 };
 
 enum { CODEC_HEVC = 1, CODEC_H264 = 2 };
+enum { AUTH_OK = 0, AUTH_PAIRING_PENDING = 1, AUTH_PAIRING_DENIED = 2, AUTH_BUSY = 3, AUTH_PAIRED = 4 };
+enum { BYE_USER = 0, BYE_TAKEN_OVER = 1, BYE_UNPAIRED = 2, BYE_HOST_QUITTING = 3 };
+enum { GOODBYE_QUIT = 0, GOODBYE_SWITCHING = 1 };
 
 typedef struct {
     // configuration
@@ -92,17 +102,25 @@ typedef struct {
 
 static Stream g_streams[MAX_STREAMS];
 static int g_nstreams;
-static Config g_cfg;          // written on the main thread under g_shared_lock
+static Config g_cfg;          // main thread only
 static int g_force_sw;
 static int g_cli_monitors;    // --monitor given: don't use the saved monitor selection
 static SDL_Thread *g_net_thread;
 static SDL_atomic_t g_net_stop;
 static SDL_atomic_t g_connected;
 static SDL_atomic_t g_session_gen;
-static SDL_atomic_t g_paused;  // the Mac said goodbye: don't reconnect until the user asks
+static SDL_atomic_t g_paused;  // disconnected on purpose: don't reconnect until the user asks
 static int g_want_mac_on_connect;
-static char g_net_host_name[128];  // the Mac's name (g_shared_lock)
-static Uint32 g_cmd_event;
+static Uint32 g_cmd_event, g_net_event;
+
+// This PC's identity, and the device the current session talks to (copied for the net thread).
+static SkKeyPair g_identity;
+static Device g_session_dev;
+static SkCipher g_cipher;      // send side guarded by g_send_lock; receive side net thread only
+
+// Per-device runtime state (main thread).
+typedef struct { int state; char status[160]; Uint32 last_seen; } DeviceRuntime;
+static DeviceRuntime g_devrt[CFG_MAX_DEVICES];
 
 // Every PC monitor (main thread).
 typedef struct { char name[64]; int x, y, w, h, hz; int selected; } PCMonitor;
@@ -115,7 +133,29 @@ static int g_nfound;
 static SDL_atomic_t g_searching;
 static Uint32 g_last_search;
 
-enum { CMD_INTERNAL_STATUS = 90, CMD_INTERNAL_DISCOVERY_DONE = 91 };
+enum { CMD_INTERNAL_DISCOVERY_DONE = 91 };
+
+// Events from the net thread to the main thread.
+enum {
+    NE_CONNECTING = 1,
+    NE_HOST,          // handshake done: name, pub, platform, version
+    NE_PAIRING,       // text = code
+    NE_PAIRED,
+    NE_DENIED,
+    NE_BUSY,          // text = PC in control
+    NE_CONNECTED,
+    NE_DISCONNECTED,
+    NE_BYE,           // arg = reason, text = detail
+    NE_VERSION,       // text = the device's app version
+    NE_KEY_CHANGED,
+};
+typedef struct {
+    int gen, code, arg, platform;
+    char text[160];
+    char version[64];
+    uint8_t pub[32];
+} NetEvent;
+static NetEvent g_last_host;  // the device the current session's handshake verified (main thread)
 static SDL_atomic_t g_quit;
 static Uint32 g_frame_event;
 static SOCKET g_sock = INVALID_SOCKET;
@@ -204,23 +244,30 @@ static int recv_all(SOCKET s, uint8_t *buf, int len) {
     return 0;
 }
 
+/// Sends one message through the encrypted channel.
 static int send_msg(uint8_t type, uint8_t stream, const uint8_t *payload, uint32_t len) {
-    uint8_t hdr[8];
-    hdr[0] = type;
-    hdr[1] = stream;
-    put_u16(hdr + 2, 0);
-    put_u32(hdr + 4, len);
+    size_t plain_len = 8 + (size_t)len;
+    uint8_t *rec = malloc(4 + plain_len + SK_TAG);
+    uint8_t *plain = malloc(plain_len);
+    if (!rec || !plain) { free(rec); free(plain); return -1; }
+    plain[0] = type;
+    plain[1] = stream;
+    put_u16(plain + 2, 0);
+    put_u32(plain + 4, len);
+    if (len) memcpy(plain + 8, payload, len);
     SDL_LockMutex(g_send_lock);
     int r = -1;
     if (g_sock != INVALID_SOCKET) {
-        r = send_all(g_sock, hdr, 8);
-        if (r == 0 && len) r = send_all(g_sock, payload, (int)len);
+        size_t n = sk_seal(&g_cipher, plain, plain_len, rec);
+        r = send_all(g_sock, rec, (int)n);
     }
     SDL_UnlockMutex(g_send_lock);
+    sk_wipe(plain, plain_len);
+    free(plain);
+    free(rec);
     return r;
 }
 
-/// connect() with a timeout, so a wrong or sleeping Mac doesn't block for ~20 s.
 static int connect_timeout(SOCKET s, const struct sockaddr *addr, int len, int timeout_ms) {
     u_long nb = 1;
     ioctlsocket(s, FIONBIO, &nb);
@@ -496,13 +543,84 @@ static void net_sleep(int ms) {
     for (int t = 0; t < ms && !net_should_stop(); t += 50) SDL_Delay(50);
 }
 
-static void post_status(int connected, int gen) {
+static void post_net(int gen, int code, int arg, const char *text, const SkHello *host) {
+    NetEvent *e = calloc(1, sizeof *e);
+    e->gen = gen;
+    e->code = code;
+    e->arg = arg;
+    if (text) snprintf(e->text, sizeof e->text, "%s", text);
+    if (host) {
+        memcpy(e->pub, host->static_pub, 32);
+        e->platform = host->platform;
+        snprintf(e->version, sizeof e->version, "%s", host->version);
+        if (!text) snprintf(e->text, sizeof e->text, "%s", host->name);
+    }
     SDL_Event ev = {0};
-    ev.type = g_cmd_event;
-    ev.user.code = CMD_INTERNAL_STATUS;
-    ev.user.data1 = (void *)(intptr_t)connected;
-    ev.user.data2 = (void *)(intptr_t)gen;
+    ev.type = g_net_event;
+    ev.user.data1 = e;
     SDL_PushEvent(&ev);
+}
+
+static void pc_name(char *out, size_t n) {
+    char name[MAX_COMPUTERNAME_LENGTH + 1] = "PC";
+    DWORD len = sizeof name;
+    GetComputerNameA(name, &len);
+    snprintf(out, n, "%s", name);
+}
+
+/// Runs the handshake on a fresh socket. Returns 0 when the channel is up; on failure posts
+/// the reason (and pauses for problems the user must fix).
+static int client_handshake(SOCKET s, int gen) {
+    SkKeyPair eph;
+    sk_random(eph.priv, 32);
+    sk_keypair_complete(&eph);
+    SkHello ch = {0};
+    ch.proto = SK_PROTO_VERSION;
+    memcpy(ch.static_pub, g_identity.pub, 32);
+    memcpy(ch.eph_pub, eph.pub, 32);
+    pc_name(ch.name, sizeof ch.name);
+    snprintf(ch.version, sizeof ch.version, "%s", SOFTKVM_VERSION);
+    ch.platform = SK_PLATFORM_WINDOWS;
+    uint8_t cbuf[SK_MAX_HELLO + 4], hbuf[SK_MAX_HELLO];
+    size_t cl = sk_hello_encode(&ch, cbuf + 4, SK_MAX_HELLO);
+    put_u32(cbuf, (uint32_t)cl);
+    if (send_all(s, cbuf, (int)(cl + 4)) < 0) return -1;
+
+    uint8_t lenb[4];
+    if (recv_all(s, lenb, 4) < 0) return -1;
+    uint32_t hl = get_u32(lenb);
+    if (hl == 0 || hl > SK_MAX_HELLO || recv_all(s, hbuf, (int)hl) < 0) return -1;
+    SkHello hh;
+    if (sk_hello_decode(hbuf, hl, &hh) < 0) {
+        LOG("net: the device didn't answer like SoftKVM");
+        return -1;
+    }
+    if (hh.proto != SK_PROTO_VERSION || hh.status == SK_STATUS_VERSION_MISMATCH) {
+        LOG("net: version mismatch: %s runs SoftKVM %s (protocol v%u), this PC runs %s (v%d)", hh.name, hh.version,
+            hh.proto, SOFTKVM_VERSION, SK_PROTO_VERSION);
+        SDL_AtomicSet(&g_paused, 1);
+        post_net(gen, NE_VERSION, 0, NULL, &hh);
+        return -1;
+    }
+    if (g_session_dev.has_key && memcmp(g_session_dev.pub, hh.static_pub, 32) != 0) {
+        // Not the device we paired with (reinstalled, or something impersonating it).
+        char want[17], got[17];
+        sk_device_id(g_session_dev.pub, want);
+        sk_device_id(hh.static_pub, got);
+        LOG("net: %s presented key %s, expected %s; refusing", g_session_dev.addr, got, want);
+        SDL_AtomicSet(&g_paused, 1);
+        post_net(gen, NE_KEY_CHANGED, 0, NULL, &hh);
+        return -1;
+    }
+    SDL_LockMutex(g_send_lock);
+    sk_client_keys(&g_cipher, cbuf + 4, cl, hbuf, hl, &g_identity, &eph, &hh);
+    SDL_UnlockMutex(g_send_lock);
+    sk_wipe(&eph, sizeof eph);
+    char id[17];
+    sk_device_id(hh.static_pub, id);
+    LOG("net: secure channel to %s (%s, SoftKVM %s)", hh.name, id, hh.version);
+    post_net(gen, NE_HOST, 0, NULL, &hh);
+    return 0;
 }
 
 static int net_thread(void *unused) {
@@ -511,93 +629,137 @@ static int net_thread(void *unused) {
     uint32_t cap = 0;
     int gen = SDL_AtomicGet(&g_session_gen);
     while (!net_should_stop()) {
+        if (SDL_AtomicGet(&g_paused)) {  // disconnected on purpose: wait for the user
+            net_sleep(300);
+            continue;
+        }
         char host[64];
         int port;
         SDL_LockMutex(g_shared_lock);
-        snprintf(host, sizeof host, "%s", g_cfg.host);
-        port = g_cfg.port;
+        snprintf(host, sizeof host, "%s", g_session_dev.addr);
+        port = g_session_dev.port;
         SDL_UnlockMutex(g_shared_lock);
-        if (!host[0] || SDL_AtomicGet(&g_paused)) {  // no Mac chosen yet, or disconnected on purpose
+        if (!host[0]) {
             net_sleep(500);
             continue;
         }
-        LOG("net: connecting to %s:%d", host, port);
+        post_net(gen, NE_CONNECTING, 0, NULL, NULL);
+        LOG("net: connecting to %s (%s:%d)", g_session_dev.name, host, port);
         SOCKET s = connect_host(host, port);
         if (s == INVALID_SOCKET) {
             LOG("net: connect failed, retrying in 2s");
+            post_net(gen, NE_DISCONNECTED, 0, NULL, NULL);
             net_sleep(2000);
             continue;
         }
         SDL_LockMutex(g_send_lock);
         g_sock = s;
         SDL_UnlockMutex(g_send_lock);
-        if (net_should_stop()) goto disconnected;
-        LOG("net: connected");
-        if (send_hello() < 0 || send_monitors() < 0) goto disconnected;
+        int authorized = 0;
+        if (net_should_stop() || client_handshake(s, gen) < 0) goto disconnected;
 
         for (;;) {
-            uint8_t hdr[8];
-            if (recv_all(s, hdr, 8) < 0) break;
-            uint8_t type = hdr[0], stream = hdr[1];
-            uint32_t len = get_u32(hdr + 4);
-            if (len > MAX_PAYLOAD) {
-                LOG("net: payload too large (%u)", len);
+            uint8_t hdr[4];
+            if (recv_all(s, hdr, 4) < 0) break;
+            uint32_t rl = get_u32(hdr);
+            if (rl < SK_TAG + 8 || rl > MAX_PAYLOAD + 8 + SK_TAG) {
+                LOG("net: bad record length (%u)", rl);
                 break;
             }
-            if (len + AV_INPUT_BUFFER_PADDING_SIZE > cap) {
-                cap = len + AV_INPUT_BUFFER_PADDING_SIZE;
+            if (rl + AV_INPUT_BUFFER_PADDING_SIZE > cap) {
+                cap = rl + AV_INPUT_BUFFER_PADDING_SIZE;
                 buf = realloc(buf, cap);
             }
-            if (len && recv_all(s, buf, (int)len) < 0) break;
-            memset(buf + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-
-            switch (type) {
-            case MSG_HELLO_ACK: {
-                char name[128] = "";
-                if (len >= 5) {
-                    int n = buf[4] < len - 5 ? buf[4] : (int)len - 5;
-                    if (n > (int)sizeof name - 1) n = sizeof name - 1;
-                    memcpy(name, buf + 5, n);
-                    name[n] = 0;
-                }
-                LOG("net: host \"%s\" protocol v%u", name, len >= 4 ? get_u32(buf) : 0);
-                SDL_LockMutex(g_shared_lock);
-                snprintf(g_net_host_name, sizeof g_net_host_name, "%s", name);
-                SDL_UnlockMutex(g_shared_lock);
-                SDL_AtomicSet(&g_connected, 1);
-                post_status(1, gen);
+            if (recv_all(s, buf, (int)rl) < 0) break;
+            long pl = sk_open(&g_cipher, hdr, buf, rl);
+            if (pl < 8) {
+                LOG("net: record failed authentication; dropping the connection");
                 break;
             }
-            case MSG_BYE:
-                LOG("net: the Mac disconnected us; not reconnecting until asked");
-                SDL_AtomicSet(&g_paused, 1);
+            uint8_t type = buf[0], stream = buf[1];
+            uint32_t len = get_u32(buf + 4);
+            if (len > (uint32_t)pl - 8) break;
+            uint8_t *msg = buf + 8;  // decoders read past the end: keep the padding zeroed
+            memset(msg + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);  // fits: cap >= rl + padding
+
+            if (type == MSG_AUTH_STATUS && len >= 1) {
+                char text[160] = "";
+                if (len >= 2) {
+                    int n = msg[1] < len - 2 ? msg[1] : (int)len - 2;
+                    if (n > (int)sizeof text - 1) n = sizeof text - 1;
+                    memcpy(text, msg + 2, n);
+                    text[n] = 0;
+                }
+                switch (msg[0]) {
+                case AUTH_OK:
+                    authorized = 1;
+                    LOG("net: authorized");
+                    if (send_hello() < 0 || send_monitors() < 0) goto disconnected;
+                    break;
+                case AUTH_PAIRED:
+                    LOG("net: paired");
+                    post_net(gen, NE_PAIRED, 0, NULL, NULL);
+                    break;
+                case AUTH_PAIRING_PENDING:
+                    LOG("net: waiting for approval on the device (code %s)", g_cipher.code);
+                    post_net(gen, NE_PAIRING, 0, g_cipher.code, NULL);
+                    break;
+                case AUTH_PAIRING_DENIED:
+                    LOG("net: pairing was refused on the device");
+                    SDL_AtomicSet(&g_paused, 1);
+                    post_net(gen, NE_DENIED, 0, NULL, NULL);
+                    goto disconnected;
+                case AUTH_BUSY:
+                    LOG("net: in use by %s", text);
+                    post_net(gen, NE_BUSY, 0, text, NULL);
+                    break;
+                }
+                continue;
+            }
+            if (type == MSG_BYE) {
+                int reason = len >= 1 ? msg[0] : BYE_USER;
+                char text[160] = "";
+                if (len >= 2) {
+                    int n = msg[1] < len - 2 ? msg[1] : (int)len - 2;
+                    if (n > (int)sizeof text - 1) n = sizeof text - 1;
+                    memcpy(text, msg + 2, n);
+                    text[n] = 0;
+                }
+                LOG("net: the device said goodbye (reason %d %s)", reason, text);
+                if (reason != BYE_HOST_QUITTING) SDL_AtomicSet(&g_paused, 1);
+                post_net(gen, NE_BYE, reason, text, NULL);
                 goto disconnected;
-            case MSG_SET_MONITORS:
-                if (len >= 4) app_post_command(CMD_SET_MONITOR_MASK, (int)get_u32(buf));
+            }
+            if (!authorized) continue;
+
+            switch (type) {
+            case MSG_HELLO_ACK:
+                SDL_AtomicSet(&g_connected, 1);
+                post_net(gen, NE_CONNECTED, 0, NULL, NULL);
                 break;
             case MSG_STREAM_INFO:
                 if (stream < g_nstreams && len >= 16) {
-                    LOG("net: stream %d is %ux%u@%u codec %u", stream, get_u32(buf), get_u32(buf + 4),
-                        get_u32(buf + 8), get_u32(buf + 12));
-                    stream_open_decoder(&g_streams[stream], (int)get_u32(buf + 12));
+                    LOG("net: stream %d is %ux%u@%u codec %u", stream, get_u32(msg), get_u32(msg + 4),
+                        get_u32(msg + 8), get_u32(msg + 12));
+                    stream_open_decoder(&g_streams[stream], (int)get_u32(msg + 12));
                 }
                 break;
             case MSG_VIDEO:
-                if (stream < g_nstreams) decode_video(stream, buf, len);
+                if (stream < g_nstreams) decode_video(stream, msg, len);
                 break;
             case MSG_AUDIO:
-                play_audio(buf, len);
+                play_audio(msg, len);
                 break;
             case MSG_LAYOUT:
-                handle_layout(buf, len);
+                handle_layout(msg, len);
                 break;
             case MSG_CURSOR:
-                handle_cursor_shape(buf, len);
+                handle_cursor_shape(msg, len);
                 break;
             case MSG_CURSOR_POS:
                 if (len >= 8) {
                     float x, y;
-                    uint32_t ux = get_u32(buf), uy = get_u32(buf + 4);
+                    uint32_t ux = get_u32(msg), uy = get_u32(msg + 4);
                     memcpy(&x, &ux, 4);
                     memcpy(&y, &uy, 4);
                     SDL_LockMutex(g_shared_lock);
@@ -608,19 +770,21 @@ static int net_thread(void *unused) {
                     notify_main();
                 }
                 break;
+            case MSG_SET_MONITORS:
+                if (len >= 4) app_post_command(CMD_SET_MONITOR_MASK, (int)get_u32(msg));
+                break;
             default:
                 break;
             }
         }
     disconnected:
         LOG("net: disconnected");
-        if (SDL_AtomicGet(&g_connected)) {
-            SDL_AtomicSet(&g_connected, 0);
-            post_status(0, gen);
-        }
+        SDL_AtomicSet(&g_connected, 0);
+        post_net(gen, NE_DISCONNECTED, 0, NULL, NULL);
         SDL_LockMutex(g_send_lock);
         closesocket(s);
         g_sock = INVALID_SOCKET;
+        sk_wipe(&g_cipher, sizeof g_cipher);
         SDL_UnlockMutex(g_send_lock);
         for (int i = 0; i < g_nstreams; i++) stream_close_decoder(&g_streams[i]);
         if (g_audio) {
@@ -952,17 +1116,35 @@ static int forward_input(const SDL_Event *ev) {
 
 static void usage(void) {
     fprintf(stderr,
-            "usage: softkvm [MAC_ADDRESS] [--port P] [--monitor N[:WxH@FPS]]... [--sw-decode]\n"
+            "usage: softkvm [DEVICE_ADDRESS] [--port P] [--monitor N[:WxH@FPS]]... [--sw-decode]\n"
             "               [--start-hidden] [--mac-modifiers]\n"
-            "  Settings (Mac, monitors, keyboard) are normally chosen from the tray icon and saved.\n"
-            "  Ctrl+Alt+Space switches between Mac and PC. Ctrl+Alt+Q quits.\n");
+            "  Devices, monitors and the keyboard style are normally chosen from the tray icon and saved.\n"
+            "  Ctrl+Alt+Space switches between this PC and the active device; Ctrl+Alt+1..9 picks a device.\n");
 }
 
 // ---------------------------------------------------------------------------
-// Monitors and sessions (main thread)
+// Devices, monitors and sessions (main thread)
 
-/// Reads every PC monitor and marks which ones the saved settings select.
+static Device *active_dev(void) {
+    return g_cfg.active >= 0 && g_cfg.active < g_cfg.ndevices ? &g_cfg.devices[g_cfg.active] : NULL;
+}
+
+static void set_dev_state(int i, int state, const char *status) {
+    if (i < 0 || i >= g_cfg.ndevices) return;
+    g_devrt[i].state = state;
+    snprintf(g_devrt[i].status, sizeof g_devrt[i].status, "%s", status ? status : "");
+}
+
+static int find_device_by_pub(const uint8_t pub[32]) {
+    for (int i = 0; i < g_cfg.ndevices; i++)
+        if (g_cfg.devices[i].has_key && !memcmp(g_cfg.devices[i].pub, pub, 32)) return i;
+    return -1;
+}
+
+/// Reads every PC monitor and marks which ones the active device uses.
 static void refresh_pc_monitors(void) {
+    Device *d = active_dev();
+    const char *sel = d ? d->monitors : "";
     g_npcmons = 0;
     int any_selected = 0;
     for (int i = 0; i < SDL_GetNumVideoDisplays() && g_npcmons < MAX_STREAMS; i++) {
@@ -978,12 +1160,11 @@ static void refresh_pc_monitors(void) {
         m->w = dm.w;
         m->h = dm.h;
         m->hz = dm.refresh_rate;
-        // Saved selection is a ';'-separated list of monitor names.
-        char list[520];
-        snprintf(list, sizeof list, ";%s;", g_cfg.monitors);
-        char key[80];
+        // The selection is a ';'-separated list of monitor names.
+        char list[520], key[80];
+        snprintf(list, sizeof list, ";%s;", sel);
         snprintf(key, sizeof key, ";%s;", m->name);
-        m->selected = g_cfg.monitors[0] == 0 || strstr(list, key) != NULL;
+        m->selected = sel[0] == 0 || strstr(list, key) != NULL;
         any_selected |= m->selected;
     }
     if (!any_selected)
@@ -991,15 +1172,15 @@ static void refresh_pc_monitors(void) {
 }
 
 static void save_monitor_selection(void) {
+    Device *d = active_dev();
+    if (!d) return;
     char list[512] = "";
     for (int i = 0; i < g_npcmons; i++) {
         if (!g_pcmons[i].selected) continue;
         if (list[0]) strncat(list, ";", sizeof list - strlen(list) - 1);
         strncat(list, g_pcmons[i].name, sizeof list - strlen(list) - 1);
     }
-    SDL_LockMutex(g_shared_lock);
-    snprintf(g_cfg.monitors, sizeof g_cfg.monitors, "%s", list);
-    SDL_UnlockMutex(g_shared_lock);
+    snprintf(d->monitors, sizeof d->monitors, "%s", list);
     config_save(&g_cfg);
 }
 
@@ -1038,7 +1219,10 @@ static void reset_remote_state(void) {
     g_cursor_valid = 0;
 }
 
+/// Starts talking to the active device (if any): windows for its monitors plus the net thread.
 static void start_session(void) {
+    Device *d = active_dev();
+    if (!d) return;
     if (!g_cli_monitors) {
         g_nstreams = 0;
         for (int i = 0; i < g_npcmons; i++)
@@ -1057,18 +1241,28 @@ static void start_session(void) {
         LOG("stream %d -> monitor %d (%s), requesting %dx%d@%d", i, s->monitor, SDL_GetDisplayName(s->monitor),
             s->w, s->h, s->fps);
     }
+    SDL_LockMutex(g_shared_lock);
+    g_session_dev = *d;
+    SDL_UnlockMutex(g_shared_lock);
+    set_dev_state(g_cfg.active, DEV_CONNECTING, "");
     SDL_AtomicSet(&g_net_stop, 0);
     g_net_thread = SDL_CreateThread(net_thread, "net", NULL);
 }
 
-static void stop_session(void) {
-    SDL_AtomicIncRef(&g_session_gen);  // status events from the old session are ignored
+/// Stops the session. goodbye >= 0 tells the device why we're leaving (GOODBYE_*).
+static void stop_session(int goodbye) {
+    if (goodbye >= 0 && SDL_AtomicGet(&g_connected)) {
+        uint8_t reason = (uint8_t)goodbye;
+        send_msg(MSG_GOODBYE, 0, &reason, 1);
+    }
+    SDL_AtomicIncRef(&g_session_gen);  // events from the old session are ignored
     SDL_AtomicSet(&g_net_stop, 1);
     SDL_LockMutex(g_send_lock);
     if (g_sock != INVALID_SOCKET) shutdown(g_sock, SD_BOTH);
     SDL_UnlockMutex(g_send_lock);
     if (g_net_thread) SDL_WaitThread(g_net_thread, NULL);
     g_net_thread = NULL;
+    SDL_AtomicSet(&g_connected, 0);
     for (int i = 0; i < g_nstreams; i++) {
         Stream *s = &g_streams[i];
         stream_close_decoder(s);
@@ -1085,15 +1279,29 @@ static void stop_session(void) {
     }
     if (!g_cli_monitors) g_nstreams = 0;
     reset_remote_state();
+    tray_hide_code();
 }
 
-/// Applies a new monitor selection: the Mac recreates its displays to match.
+/// Applies a new monitor selection: the device recreates its displays to match.
 static void restart_session(void) {
     int was_mac = g_mac_mode;
     if (g_mac_mode) set_mac_mode(0);
-    stop_session();
+    stop_session(-1);
     start_session();
-    if (was_mac) g_mac_mode = 1;  // re-entered once the new session connects
+    if (was_mac) g_want_mac_on_connect = 1;  // back to the device once it reconnects
+}
+
+static void switch_to_device(int n) {
+    if (n < 0 || n >= g_cfg.ndevices) return;
+    if (g_mac_mode) set_mac_mode(0);
+    stop_session(GOODBYE_SWITCHING);
+    g_cfg.active = n;
+    config_save(&g_cfg);
+    refresh_pc_monitors();
+    SDL_AtomicSet(&g_paused, 0);
+    g_want_mac_on_connect = 1;
+    LOG("device: switching to %s", g_cfg.devices[n].name);
+    start_session();
 }
 
 // ---------------------------------------------------------------------------
@@ -1118,6 +1326,12 @@ static void set_autostart(int on) {
     LOG("autostart: %s", on ? "on" : "off");
 }
 
+static int ask_yes_no(const char *text) {
+    wchar_t w[600];
+    MultiByteToWideChar(CP_UTF8, 0, text, -1, w, 600);
+    return MessageBoxW(NULL, w, L"SoftKVM", MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST) == IDYES;
+}
+
 void app_post_command(int cmd, int arg) {
     SDL_Event ev = {0};
     ev.type = g_cmd_event;
@@ -1126,14 +1340,38 @@ void app_post_command(int cmd, int arg) {
     SDL_PushEvent(&ev);
 }
 
+/// Devices found on the LAN that aren't added yet (g_shared_lock held by caller).
+static int available_hosts(AppHost *out) {
+    int n = 0;
+    for (int i = 0; i < g_nfound && n < APP_MAX_HOSTS; i++)
+        if (find_device_by_pub(g_found[i].pub) < 0) out[n++] = g_found[i];
+    return n;
+}
+
 void app_snapshot(AppSnapshot *out) {
     memset(out, 0, sizeof *out);
-    out->connected = SDL_AtomicGet(&g_connected);
     out->mac_mode = g_mac_mode;
+    out->active = g_cfg.active;
     out->pc_style_modifiers = g_pc_style_modifiers;
     out->autostart = autostart_enabled();
     out->searching = SDL_AtomicGet(&g_searching);
-    out->paused = SDL_AtomicGet(&g_paused);
+    snprintf(out->version, sizeof out->version, "%s", SOFTKVM_VERSION);
+    Uint32 now = SDL_GetTicks();
+    out->ndevices = g_cfg.ndevices < APP_MAX_DEVICES ? g_cfg.ndevices : APP_MAX_DEVICES;
+    for (int i = 0; i < out->ndevices; i++) {
+        AppDevice *d = &out->devices[i];
+        snprintf(d->name, sizeof d->name, "%s", g_cfg.devices[i].name);
+        snprintf(d->addr, sizeof d->addr, "%s", g_cfg.devices[i].addr);
+        d->platform = g_cfg.devices[i].platform;
+        int seen = g_devrt[i].last_seen && now - g_devrt[i].last_seen < 45000;
+        if (i == g_cfg.active) {
+            d->state = g_devrt[i].state;
+            if (d->state == DEV_CONNECTING && !seen) d->state = DEV_OFFLINE;
+        } else {
+            d->state = seen ? DEV_ONLINE : DEV_OFFLINE;
+        }
+        snprintf(d->status, sizeof d->status, "%s", g_devrt[i].status);
+    }
     out->nmonitors = g_npcmons;
     for (int i = 0; i < g_npcmons && i < APP_MAX_MONITORS; i++) {
         snprintf(out->monitors[i].name, sizeof out->monitors[i].name, "%s", g_pcmons[i].name);
@@ -1143,10 +1381,7 @@ void app_snapshot(AppSnapshot *out) {
         out->monitors[i].selected = g_pcmons[i].selected;
     }
     SDL_LockMutex(g_shared_lock);
-    snprintf(out->host_name, sizeof out->host_name, "%s", out->connected ? g_net_host_name : g_cfg.host_name);
-    snprintf(out->host_addr, sizeof out->host_addr, "%s", g_cfg.host);
-    out->nhosts = g_nfound;
-    memcpy(out->hosts, g_found, sizeof g_found);
+    out->navailable = available_hosts(out->available);
     SDL_UnlockMutex(g_shared_lock);
 }
 
@@ -1158,7 +1393,6 @@ static int discovery_thread(void *unused) {
     memcpy(g_found, found, sizeof found);
     g_nfound = n;
     SDL_UnlockMutex(g_shared_lock);
-    LOG("discovery: found %d Mac(s)%s%s", n, n ? ", first: " : "", n ? found[0].name : "");
     SDL_AtomicSet(&g_searching, 0);
     app_post_command(CMD_INTERNAL_DISCOVERY_DONE, 0);
     return 0;
@@ -1170,48 +1404,166 @@ static void start_discovery(void) {
     SDL_DetachThread(SDL_CreateThread(discovery_thread, "discovery", NULL));
 }
 
-static void select_host(const AppHost *h) {
-    SDL_LockMutex(g_shared_lock);
-    int changed = strcmp(g_cfg.host, h->addr) != 0 || g_cfg.port != h->port;
-    snprintf(g_cfg.host, sizeof g_cfg.host, "%s", h->addr);
-    snprintf(g_cfg.host_name, sizeof g_cfg.host_name, "%s", h->name);
-    g_cfg.port = h->port;
-    SDL_UnlockMutex(g_shared_lock);
+static int add_device(const AppHost *h) {
+    if (g_cfg.ndevices >= CFG_MAX_DEVICES) return -1;
+    int i = g_cfg.ndevices++;
+    Device *d = &g_cfg.devices[i];
+    memset(d, 0, sizeof *d);
+    snprintf(d->name, sizeof d->name, "%s", h->name);
+    snprintf(d->addr, sizeof d->addr, "%s", h->addr);
+    d->port = h->port;
+    d->platform = h->platform;
+    memcpy(d->pub, h->pub, 32);  // pin the key it announced; pairing confirms it on the device
+    d->has_key = 1;
+    memset(&g_devrt[i], 0, sizeof g_devrt[i]);
+    g_devrt[i].last_seen = SDL_GetTicks();
     config_save(&g_cfg);
-    LOG("mac: selected %s (%s:%d)", h->name, h->addr, h->port);
-    if (changed) restart_session();
+    LOG("device: added %s (%s)", d->name, d->addr);
+    return i;
+}
+
+/// Updates online status and addresses of known devices from discovery results.
+static void merge_discovery(void) {
+    AppHost found[APP_MAX_HOSTS];
+    SDL_LockMutex(g_shared_lock);
+    int n = g_nfound;
+    memcpy(found, g_found, sizeof found);
+    SDL_UnlockMutex(g_shared_lock);
+    int changed = 0;
+    for (int f = 0; f < n; f++) {
+        int i = find_device_by_pub(found[f].pub);
+        if (i < 0) {  // a device from 0.1 (no key yet) at the same address
+            for (int k = 0; k < g_cfg.ndevices; k++)
+                if (!g_cfg.devices[k].has_key && !strcmp(g_cfg.devices[k].addr, found[f].addr)) i = k;
+        }
+        if (i < 0) continue;
+        Device *d = &g_cfg.devices[i];
+        g_devrt[i].last_seen = SDL_GetTicks();
+        if (strcmp(d->addr, found[f].addr) || d->port != found[f].port) {
+            LOG("device: %s moved %s -> %s", d->name, d->addr, found[f].addr);
+            snprintf(d->addr, sizeof d->addr, "%s", found[f].addr);
+            d->port = found[f].port;
+            changed = 1;
+            if (i == g_cfg.active) {  // the net thread picks it up on its next attempt
+                SDL_LockMutex(g_shared_lock);
+                snprintf(g_session_dev.addr, sizeof g_session_dev.addr, "%s", d->addr);
+                g_session_dev.port = d->port;
+                SDL_UnlockMutex(g_shared_lock);
+            }
+        }
+    }
+    if (changed) config_save(&g_cfg);
+    // First run: nothing added yet, so start pairing with the first device found.
+    if (g_cfg.ndevices == 0) {
+        AppHost avail[APP_MAX_HOSTS];
+        SDL_LockMutex(g_shared_lock);
+        int na = available_hosts(avail);
+        SDL_UnlockMutex(g_shared_lock);
+        if (na > 0 && avail[0].proto == SK_PROTO_VERSION) {
+            int i = add_device(&avail[0]);
+            if (i >= 0) switch_to_device(i);
+        }
+    }
 }
 
 static void update_tray(void) {
     AppSnapshot st;
     app_snapshot(&st);
     char tip[128];
-    if (st.connected) snprintf(tip, sizeof tip, "SoftKVM — %s (%s)", st.host_name, st.mac_mode ? "on the Mac" : "on the PC");
-    else if (st.paused) snprintf(tip, sizeof tip, "SoftKVM — disconnected (Ctrl+Alt+Space to reconnect)");
-    else snprintf(tip, sizeof tip, "SoftKVM — %s", st.host_addr[0] ? "connecting…" : "looking for a Mac…");
-    tray_set_status(st.connected, tip);
+    int connected = st.active >= 0 && st.devices[st.active].state == DEV_CONNECTED;
+    if (st.active < 0) snprintf(tip, sizeof tip, "SoftKVM — no device yet");
+    else if (connected)
+        snprintf(tip, sizeof tip, "SoftKVM — %s (%s)", st.devices[st.active].name, st.mac_mode ? "in control" : "ready");
+    else snprintf(tip, sizeof tip, "SoftKVM — %s: not connected", st.devices[st.active].name);
+    tray_set_status(connected, tip);
 }
 
-static void handle_command(int cmd, int arg, int gen) {
-    switch (cmd) {
-    case CMD_RECONNECT:
-        if (SDL_AtomicGet(&g_paused)) {
-            LOG("net: reconnecting at the user's request");
-            SDL_AtomicSet(&g_paused, 0);
-            g_want_mac_on_connect = 1;
-        }
-        break;
-    case CMD_TOGGLE_MODE:
-        if (!g_mac_mode && SDL_AtomicGet(&g_paused)) {  // the hotkey also reconnects
-            handle_command(CMD_RECONNECT, 0, 0);
-            return;
-        }
-        if (!g_mac_mode && !SDL_AtomicGet(&g_connected)) {
-            LOG("mode: not connected to a Mac; staying on the PC");
-            break;
-        }
+static void offer_takeover(void) {
+    Device *d = active_dev();
+    if (!d) return;
+    char q[400];
+    snprintf(q, sizeof q, "%s is being controlled by %s.\n\nTake over?", d->name, g_devrt[g_cfg.active].status);
+    if (ask_yes_no(q)) {
+        LOG("device: taking over %s", d->name);
+        send_msg(MSG_TAKEOVER, 0, NULL, 0);
+        g_want_mac_on_connect = 1;
+    }
+}
+
+/// What the hotkey / clicking the active device does, depending on its state.
+static void use_active_device(void) {
+    int i = g_cfg.active;
+    if (i < 0) return;
+    switch (g_devrt[i].state) {
+    case DEV_CONNECTED:
         toggle_mode();
         break;
+    case DEV_BUSY:
+        offer_takeover();
+        break;
+    case DEV_PAUSED:
+    case DEV_ERROR:
+        LOG("device: reconnecting to %s", g_cfg.devices[i].name);
+        SDL_AtomicSet(&g_paused, 0);
+        set_dev_state(i, DEV_CONNECTING, "");
+        g_want_mac_on_connect = 1;
+        break;
+    default:
+        if (g_mac_mode) set_mac_mode(0);
+        break;
+    }
+}
+
+static void handle_command(int cmd, int arg) {
+    switch (cmd) {
+    case CMD_TOGGLE_MODE:
+        if (g_mac_mode) set_mac_mode(0);
+        else use_active_device();
+        break;
+    case CMD_SELECT_DEVICE:
+        if (arg == g_cfg.active) use_active_device();
+        else switch_to_device(arg);
+        break;
+    case CMD_RECONNECT:
+        use_active_device();
+        break;
+    case CMD_ADD_DEVICE: {
+        AppHost avail[APP_MAX_HOSTS];
+        SDL_LockMutex(g_shared_lock);
+        int na = available_hosts(avail);
+        SDL_UnlockMutex(g_shared_lock);
+        if (arg < 0 || arg >= na) break;
+        int i = add_device(&avail[arg]);
+        if (i >= 0) switch_to_device(i);
+        break;
+    }
+    case CMD_FORGET_DEVICE: {
+        if (arg < 0 || arg >= g_cfg.ndevices) break;
+        char q[300];
+        snprintf(q, sizeof q, "Forget %s?\n\nYou'll have to pair it again (approve on the device) to use it.",
+                 g_cfg.devices[arg].name);
+        if (!ask_yes_no(q)) break;
+        LOG("device: forgetting %s", g_cfg.devices[arg].name);
+        int was_active = arg == g_cfg.active;
+        if (was_active) {
+            if (g_mac_mode) set_mac_mode(0);
+            stop_session(GOODBYE_QUIT);
+        }
+        for (int k = arg; k < g_cfg.ndevices - 1; k++) {
+            g_cfg.devices[k] = g_cfg.devices[k + 1];
+            g_devrt[k] = g_devrt[k + 1];
+        }
+        g_cfg.ndevices--;
+        if (was_active) g_cfg.active = g_cfg.ndevices ? 0 : -1;
+        else if (arg < g_cfg.active) g_cfg.active--;
+        config_save(&g_cfg);
+        if (was_active) {
+            refresh_pc_monitors();
+            g_want_mac_on_connect = 0;
+            start_session();
+        }
+        break;
+    }
     case CMD_TOGGLE_MONITOR: {
         if (arg < 0 || arg >= g_npcmons) break;
         int selected = 0;
@@ -1225,29 +1577,19 @@ static void handle_command(int cmd, int arg, int gen) {
     }
     case CMD_SET_MONITOR_MASK: {
         unsigned mask = (unsigned)arg;
-        int any = 0;
+        int any = 0, changed = 0;
         for (int i = 0; i < g_npcmons; i++) any |= (mask >> i) & 1;
         if (!any) break;
-        int changed = 0;
         for (int i = 0; i < g_npcmons; i++) {
             int on = (mask >> i) & 1;
             changed |= on != g_pcmons[i].selected;
             g_pcmons[i].selected = on;
         }
         if (!changed) break;
-        LOG("monitors: the Mac asked for mask %u", mask);
+        LOG("monitors: the device asked for mask %u", mask);
         g_cli_monitors = 0;
         save_monitor_selection();
         restart_session();
-        break;
-    }
-    case CMD_SELECT_HOST: {
-        AppHost h;
-        SDL_LockMutex(g_shared_lock);
-        int ok = arg >= 0 && arg < g_nfound;
-        if (ok) h = g_found[arg];
-        SDL_UnlockMutex(g_shared_lock);
-        if (ok) select_host(&h);
         break;
     }
     case CMD_SET_MODIFIERS:
@@ -1271,27 +1613,105 @@ static void handle_command(int cmd, int arg, int gen) {
     case CMD_QUIT:
         SDL_AtomicSet(&g_quit, 1);
         break;
-    case CMD_INTERNAL_STATUS:
-        if (gen != SDL_AtomicGet(&g_session_gen)) break;  // from a session we already replaced
-        if (arg) {
-            // Reconnected after a monitor change while on the Mac: show the new windows.
-            if (g_mac_mode) set_mac_mode(1);
-        } else if (g_mac_mode) {
-            LOG("mode: lost the Mac; back to the PC");
+    case CMD_INTERNAL_DISCOVERY_DONE:
+        merge_discovery();
+        break;
+    default:
+        break;
+    }
+    update_tray();
+}
+
+/// Reacts to what the net thread saw.
+static void handle_net_event(NetEvent *e) {
+    int i = g_cfg.active;
+    Device *d = active_dev();
+    if (e->gen != SDL_AtomicGet(&g_session_gen) || !d) return;
+    char msg[300];
+    switch (e->code) {
+    case NE_CONNECTING:
+        if (g_devrt[i].state != DEV_PAIRING && g_devrt[i].state != DEV_BUSY) set_dev_state(i, DEV_CONNECTING, "");
+        break;
+    case NE_HOST:
+        g_devrt[i].last_seen = SDL_GetTicks();
+        g_last_host = *e;
+        break;
+    case NE_PAIRING:
+        set_dev_state(i, DEV_PAIRING, e->text);
+        tray_show_code(d->name, e->text);
+        break;
+    case NE_PAIRED:
+        tray_hide_code();
+        snprintf(msg, sizeof msg, "%s approved this PC.", d->name);
+        tray_notify("Paired", msg);
+        break;
+    case NE_DENIED:
+        tray_hide_code();
+        set_dev_state(i, DEV_PAUSED, "pairing refused on the device");
+        snprintf(msg, sizeof msg, "%s refused to pair with this PC.", d->name);
+        tray_notify("Not paired", msg);
+        break;
+    case NE_BUSY:
+        tray_hide_code();
+        set_dev_state(i, DEV_BUSY, e->text);
+        if (g_want_mac_on_connect) offer_takeover();  // the user just asked for this device
+        break;
+    case NE_CONNECTED:
+        tray_hide_code();
+        set_dev_state(i, DEV_CONNECTED, "");
+        g_devrt[i].last_seen = SDL_GetTicks();
+        // Remember the device: the key its handshake proved, and its real name.
+        memcpy(d->pub, g_last_host.pub, 32);
+        d->has_key = 1;
+        d->platform = g_last_host.platform;
+        if (!strcmp(d->name, d->addr) && g_last_host.text[0]) snprintf(d->name, sizeof d->name, "%s", g_last_host.text);
+        SDL_LockMutex(g_shared_lock);
+        memcpy(g_session_dev.pub, d->pub, 32);
+        g_session_dev.has_key = 1;
+        SDL_UnlockMutex(g_shared_lock);
+        config_save(&g_cfg);
+        if (g_want_mac_on_connect) {
+            g_want_mac_on_connect = 0;
+            set_mac_mode(1);
+        }
+        break;
+    case NE_DISCONNECTED:
+        if (!SDL_AtomicGet(&g_paused) && g_devrt[i].state != DEV_BUSY) set_dev_state(i, DEV_CONNECTING, "");
+        if (g_mac_mode) {
+            LOG("mode: lost %s; back to the PC", d->name);
             set_mac_mode(0);
         }
         break;
-    case CMD_INTERNAL_DISCOVERY_DONE: {
-        // First run: no Mac chosen yet, so connect to the first one found.
-        SDL_LockMutex(g_shared_lock);
-        int pick = !g_cfg.host[0] && g_nfound > 0;
-        AppHost h;
-        if (pick) h = g_found[0];
-        SDL_UnlockMutex(g_shared_lock);
-        if (pick) select_host(&h);
+    case NE_BYE:
+        tray_hide_code();
+        if (e->arg == BYE_TAKEN_OVER) {
+            snprintf(msg, sizeof msg, "taken over by %s", e->text);
+            set_dev_state(i, DEV_PAUSED, msg);
+            snprintf(msg, sizeof msg, "%s is now controlled by %s.", d->name, e->text);
+            tray_notify("Taken over", msg);
+        } else if (e->arg == BYE_UNPAIRED) {
+            set_dev_state(i, DEV_PAUSED, "this PC was removed on the device — click to pair again");
+            snprintf(msg, sizeof msg, "%s forgot this PC. Click it in the tray to pair again.", d->name);
+            tray_notify("Unpaired", msg);
+        } else if (e->arg == BYE_USER) {
+            set_dev_state(i, DEV_PAUSED, "disconnected from the device");
+        } else {
+            set_dev_state(i, DEV_CONNECTING, "");
+        }
         break;
-    }
-    default:
+    case NE_VERSION:
+        snprintf(msg, sizeof msg, "needs an update (device runs SoftKVM %s, this PC %s)", e->version, SOFTKVM_VERSION);
+        set_dev_state(i, DEV_ERROR, msg);
+        snprintf(msg, sizeof msg, "%s runs SoftKVM %s and this PC runs %s. Update both to the same version.", d->name,
+                 e->version, SOFTKVM_VERSION);
+        tray_notify("Version mismatch", msg);
+        break;
+    case NE_KEY_CHANGED:
+        set_dev_state(i, DEV_ERROR, "its identity changed — forget it and add it again");
+        snprintf(msg, sizeof msg,
+                 "The device at %s isn't the %s this PC paired with (it may have been reinstalled). "
+                 "Forget it and add it again if that's expected.", d->addr, d->name);
+        tray_notify("Security warning", msg);
         break;
     }
     update_tray();
@@ -1323,19 +1743,42 @@ int main(int argc, char **argv) {
     }
     SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT709);
 
+    identity_load(g_identity.priv);
+    sk_keypair_complete(&g_identity);
+    char my_id[17];
+    sk_device_id(g_identity.pub, my_id);
+    LOG("SoftKVM %s starting (protocol v%d, this PC is %s)", SOFTKVM_VERSION, SK_PROTO_VERSION, my_id);
+
     config_load(&g_cfg);
     g_pc_style_modifiers = g_cfg.pc_style_modifiers;
+    int cli_port = 0;
+    const char *cli_host = NULL;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--port") && i + 1 < argc) g_cfg.port = atoi(argv[++i]);
+        if (!strcmp(argv[i], "--port") && i + 1 < argc) cli_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--monitor") && i + 1 < argc) {
             if (parse_monitor_arg(argv[++i]) < 0) { usage(); return 1; }
         } else if (!strcmp(argv[i], "--sw-decode")) g_force_sw = 1;
         else if (!strcmp(argv[i], "--start-hidden")) g_start_hidden = 1;
         else if (!strcmp(argv[i], "--mac-modifiers")) g_pc_style_modifiers = 0;
-        else if (argv[i][0] != '-') {
-            snprintf(g_cfg.host, sizeof g_cfg.host, "%s", argv[i]);
+        else if (argv[i][0] != '-') cli_host = argv[i];
+        else { usage(); return 1; }
+    }
+    if (cli_host) {  // connect to this address (pairing it if it's new)
+        int found = -1;
+        for (int i = 0; i < g_cfg.ndevices; i++)
+            if (!strcmp(g_cfg.devices[i].addr, cli_host)) found = i;
+        if (found < 0 && g_cfg.ndevices < CFG_MAX_DEVICES) {
+            found = g_cfg.ndevices++;
+            memset(&g_cfg.devices[found], 0, sizeof(Device));
+            snprintf(g_cfg.devices[found].addr, sizeof g_cfg.devices[found].addr, "%s", cli_host);
+            snprintf(g_cfg.devices[found].name, sizeof g_cfg.devices[found].name, "%s", cli_host);
+            g_cfg.devices[found].port = DEFAULT_PORT;
+        }
+        if (found >= 0) {
+            if (cli_port) g_cfg.devices[found].port = cli_port;
+            g_cfg.active = found;
             config_save(&g_cfg);
-        } else { usage(); return 1; }
+        }
     }
     refresh_pc_monitors();
 
@@ -1356,8 +1799,9 @@ int main(int argc, char **argv) {
         g_hw_device = NULL;
     }
 
-    g_frame_event = SDL_RegisterEvents(2);
+    g_frame_event = SDL_RegisterEvents(3);
     g_cmd_event = g_frame_event + 1;
+    g_net_event = g_frame_event + 2;
     g_send_lock = SDL_CreateMutex();
     g_shared_lock = SDL_CreateMutex();
     SDL_StopTextInput();
@@ -1366,10 +1810,10 @@ int main(int argc, char **argv) {
     LOG(tray_hotkey_registered() ? "hotkey: Ctrl+Alt+Space registered"
                                  : "hotkey: Ctrl+Alt+Space is taken by another app; it only works in Mac mode");
 
-    // Start on the PC; switch to the Mac once connected (unless started hidden).
+    // Start on the PC; switch to the device once connected (unless started hidden).
     g_mac_mode = 0;
-    start_session();
     g_want_mac_on_connect = !g_start_hidden;
+    start_session();
     start_discovery();
     update_tray();
 
@@ -1383,19 +1827,18 @@ int main(int argc, char **argv) {
             if (ev.type == SDL_QUIT) {
                 SDL_AtomicSet(&g_quit, 1);
             } else if (ev.type == g_cmd_event) {
-                int cmd = ev.user.code, arg = (int)(intptr_t)ev.user.data1, gen = (int)(intptr_t)ev.user.data2;
-                if (cmd == CMD_INTERNAL_STATUS && arg && g_want_mac_on_connect &&
-                    gen == SDL_AtomicGet(&g_session_gen)) {
-                    g_want_mac_on_connect = 0;
-                    g_mac_mode = 1;  // handle_command shows the Mac windows
-                }
-                handle_command(cmd, arg, gen);
+                handle_command(ev.user.code, (int)(intptr_t)ev.user.data1);
+            } else if (ev.type == g_net_event) {
+                handle_net_event(ev.user.data1);
+                free(ev.user.data1);
             } else if (ev.type == SDL_KEYDOWN && (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_ALT) &&
-                       (ev.key.keysym.sym == SDLK_q || ev.key.keysym.sym == SDLK_SPACE)) {
-                // Local hotkeys are never forwarded. In Mac mode the keyboard grab swallows
-                // Ctrl+Alt+Space before Windows' hotkey sees it (toggle_mode debounces duplicates).
+                       (ev.key.keysym.sym == SDLK_q || ev.key.keysym.sym == SDLK_SPACE ||
+                        (ev.key.keysym.sym >= SDLK_1 && ev.key.keysym.sym <= SDLK_9))) {
+                // Local hotkeys are never forwarded. In Mac mode the keyboard grab swallows them
+                // before Windows' hotkeys see them (toggle_mode debounces duplicates).
                 if (ev.key.keysym.sym == SDLK_q) SDL_AtomicSet(&g_quit, 1);
-                else handle_command(CMD_TOGGLE_MODE, 0, 0);
+                else if (ev.key.keysym.sym == SDLK_SPACE) handle_command(CMD_TOGGLE_MODE, 0);
+                else handle_command(CMD_SELECT_DEVICE, ev.key.keysym.sym - SDLK_1);
             } else if (ev.type == SDL_WINDOWEVENT) {
                 if (ev.window.event == SDL_WINDOWEVENT_EXPOSED && g_mac_mode) {
                     int i = stream_for_window(ev.window.windowID);
@@ -1416,16 +1859,15 @@ int main(int argc, char **argv) {
         sync_shared_state();
         flush_mouse_move();
 
-        // Focus left our windows entirely (e.g. Ctrl+Alt+Del): lift keys held on the Mac.
+        // Focus left our windows entirely (e.g. Ctrl+Alt+Del): lift keys held on the device.
         if (check_focus && g_mac_mode && stream_for_window(SDL_GetKeyboardFocus()
                 ? SDL_GetWindowID(SDL_GetKeyboardFocus()) : 0) < 0) {
-            LOG("focus lost; releasing keys on the Mac");
+            LOG("focus lost; releasing keys on the device");
             send_release_all();
         }
 
-        // Keep looking for Macs while we have none.
-        if (!SDL_AtomicGet(&g_connected) && !g_cfg.host[0] && SDL_GetTicks() - g_last_search > 5000)
-            start_discovery();
+        // Keep the device list's online status and addresses fresh.
+        if (!g_mac_mode && SDL_GetTicks() - g_last_search > 15000) start_discovery();
 
         if (!g_mac_mode) continue;  // keep decoding in the background, draw when shown
         Uint32 now = SDL_GetTicks();
@@ -1441,7 +1883,7 @@ int main(int argc, char **argv) {
 
     LOG("quitting");
     if (g_mac_mode) send_release_all();
-    stop_session();
+    stop_session(GOODBYE_QUIT);
     tray_shutdown();
     SDL_Quit();
     WSACleanup();

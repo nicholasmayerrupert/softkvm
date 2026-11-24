@@ -12,7 +12,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ?? AppState.shared.bitrateMbps
         let hostName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
 
-        Log.info("SoftKVM host starting (bitrate \(bitrateMbps) Mbps)")
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
+        Log.info("SoftKVM host \(version) starting (protocol v\(Handshake.protocolVersion), "
+                 + "device \(deviceID(Identity.publicKey)), bitrate \(bitrateMbps) Mbps)")
 
         // Trigger the Screen Recording permission prompt up front rather than on first connect.
         Task {
@@ -34,11 +36,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.info("failed to start server: \(error)")
             NSApp.terminate(nil)
         }
+        server.askPairing = { name, code, reply in PairingPrompt.ask(name: name, code: code, reply: reply) }
         self.server = server
-        statusMenu = StatusMenu(server: server)
-        let discovery = DiscoveryResponder(name: { hostName })
-        discovery.start()
-        self.discovery = discovery
+        if !Proto.headless {
+            statusMenu = StatusMenu(server: server)
+            let discovery = DiscoveryResponder(name: { hostName })
+            discovery.start()
+            self.discovery = discovery
+        } else {
+            Log.info("headless test instance on port \(Proto.port)")
+        }
     }
 }
 
