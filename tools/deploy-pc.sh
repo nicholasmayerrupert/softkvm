@@ -20,7 +20,9 @@ VERSION=$(cat "$ROOT/VERSION")
 if [ "${1:-}" = "--installer" ]; then
   "$ROOT/pc-client/package.sh" >/dev/null
   scp -q $SCP_ARGS "$ROOT/pc-client/dist-installer/SoftKVM-Setup-$VERSION.exe" "$TARGET:SoftKVM-Setup.exe"
-  PS 'Start-Process -Wait -FilePath "$env:USERPROFILE\SoftKVM-Setup.exe" -ArgumentList "/S"; Remove-Item "$env:USERPROFILE\SoftKVM-Setup.exe"; "installed"'
+  # Over SSH the installer can't reach the app's window to ask it to quit, so stop it first;
+  # otherwise softkvm.exe stays locked and the old build survives the install.
+  PS "$STOP"'; Start-Process -Wait -FilePath "$env:USERPROFILE\SoftKVM-Setup.exe" -ArgumentList "/S"; Remove-Item "$env:USERPROFILE\SoftKVM-Setup.exe"; "installed " + (Get-Item "$env:LOCALAPPDATA\Programs\SoftKVM\softkvm.exe").LastWriteTime'
 else
   "$ROOT/pc-client/build.sh" >/dev/null
   PS "$STOP"'; New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\Programs\SoftKVM" | Out-Null'
