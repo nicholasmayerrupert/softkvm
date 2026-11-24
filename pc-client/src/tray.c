@@ -249,6 +249,10 @@ static LRESULT CALLBACK wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         app_post_command(CMD_SELECT_DEVICE, (int)(wp - HOTKEY_DEVICE_BASE));
         return 0;
     }
+    if (msg == WM_CLOSE) {  // the installer/uninstaller asks us to quit
+        app_post_command(CMD_QUIT, 0);
+        return 0;
+    }
     if (msg == g_taskbar_created && g_taskbar_created) {  // Explorer restarted
         add_icon();
         return 0;

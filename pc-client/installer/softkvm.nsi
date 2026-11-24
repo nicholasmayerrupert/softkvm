@@ -31,11 +31,21 @@ SetCompressor /SOLID lzma
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\SoftKVM"
 !define RUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"
 
+; Asks a running SoftKVM to quit (it says goodbye to the device first); if it's still there,
+; force-closes only the copy in the install folder (other builds may be running).
+!macro StopSoftKVM
+  FindWindow $0 "SoftKVMTray"
+  IntCmp $0 0 +3
+    SendMessage $0 ${WM_CLOSE} 0 0
+    Sleep 1500
+  nsExec::Exec `powershell -NoProfile -Command "Get-Process softkvm -ErrorAction SilentlyContinue | Where-Object { $$_.Path -like '$INSTDIR\*' } | Stop-Process -Force"`
+  Sleep 300
+!macroend
+
 Section "SoftKVM (required)" SecMain
   SectionIn RO
   ; Replace a running copy.
-  nsExec::Exec 'taskkill /IM softkvm.exe /F'
-  Sleep 500
+  !insertmacro StopSoftKVM
   SetOutPath "$INSTDIR"
   File /r "${DIST}\*.*"
   WriteUninstaller "$INSTDIR\Uninstall SoftKVM.exe"
@@ -61,8 +71,7 @@ SectionEnd
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 Section "Uninstall"
-  nsExec::Exec 'taskkill /IM softkvm.exe /F'
-  Sleep 500
+  !insertmacro StopSoftKVM
   Delete "$SMPROGRAMS\SoftKVM.lnk"
   RMDir /r "$INSTDIR"
   DeleteRegValue HKCU "${RUN_KEY}" "SoftKVM"
