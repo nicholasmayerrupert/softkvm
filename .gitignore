@@ -1,0 +1,16 @@
+# Swift
+mac-host/.build/
+mac-host/*.app
+*.xcodeproj/xcuserdata/
+.DS_Store
+
+# PC client
+pc-client/build*/
+pc-client/deps/
+*.exe
+*.dll
+
+# test artifacts
+tools/out/
+*.h265
+*.h264
