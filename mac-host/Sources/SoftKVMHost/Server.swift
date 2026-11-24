@@ -42,6 +42,7 @@ final class ClientSession: @unchecked Sendable {
     private let queue: DispatchQueue
     private let bitrate: Int
     private var pipelines: [DisplayPipeline] = []
+    private let injector = InputInjector()
     private var closed = false
     var onClose: (() -> Void)?
 
@@ -67,6 +68,11 @@ final class ClientSession: @unchecked Sendable {
             default: break
             }
         }
+        injector.displayForStream = { [weak self] i in
+            guard let self, i < self.pipelines.count, self.pipelines[i].displayID != 0 else { return nil }
+            let r = self.pipelines[i].request
+            return (self.pipelines[i].displayID, CGSize(width: Int(r.width), height: Int(r.height)))
+        }
         conn.start(queue: queue)
         readHeader()
     }
@@ -75,6 +81,7 @@ final class ClientSession: @unchecked Sendable {
         guard !closed else { return }
         closed = true
         Log.info("session: closed (\(reason))")
+        injector.releaseAll()
         conn.cancel()
         let ps = pipelines
         pipelines = []
@@ -122,7 +129,7 @@ final class ClientSession: @unchecked Sendable {
                 pipelines[Int(stream)].requestKeyframe()
             }
         case .input:
-            break // milestone 2
+            injector.handle(payload)
         default:
             Log.info("session: ignoring message type \(type)")
         }

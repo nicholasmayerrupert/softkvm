@@ -7,7 +7,9 @@
 //   softkvm.exe HOST [--monitor N[:WxH@FPS]]... [--sw-decode]
 //
 // Without --monitor, every connected monitor gets a stream at its native resolution.
-// Ctrl+Alt+Q quits.
+//
+// Ctrl+Alt+Space toggles between Mac mode (Mac windows shown, keyboard/mouse go to the Mac)
+// and PC mode (windows hidden, everything back to Windows). Ctrl+Alt+Q quits.
 
 #define SDL_MAIN_HANDLED
 #include <winsock2.h>
@@ -15,6 +17,7 @@
 #include <windows.h>
 
 #include <SDL.h>
+#include <SDL_syswm.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 
@@ -23,6 +26,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "keymap.h"
 
 #define PROTO_VERSION 0
 #define DEFAULT_PORT 47900
@@ -89,6 +94,16 @@ static FILE *g_logfile;
 #define AUDIO_MAX_MS 150
 static SDL_AudioDeviceID g_audio;
 static int g_audio_playing;
+
+// Input / mode switching
+enum { IN_MOUSE_MOVE = 1, IN_MOUSE_BUTTON = 2, IN_SCROLL = 3, IN_KEY = 4, IN_RELEASE_ALL = 5 };
+#define HOTKEY_ID_TOGGLE 1
+static int g_mac_mode = 1;
+static int g_start_hidden;
+static int g_pc_style_modifiers = 1;
+static int g_hotkey_registered;
+static Uint32 g_last_toggle;
+static struct { int valid, stream, x, y; } g_pending_move;
 
 static void logf_(const char *fmt, ...) {
     char buf[1024];
@@ -453,12 +468,141 @@ static int create_window(Stream *s, int idx) {
 }
 
 // ---------------------------------------------------------------------------
+// Input forwarding (main thread)
+
+static void send_input(const uint8_t *p, uint32_t n) { send_msg(MSG_INPUT, 0, p, n); }
+
+static void flush_mouse_move(void) {
+    if (!g_pending_move.valid) return;
+    uint8_t p[10];
+    p[0] = IN_MOUSE_MOVE;
+    p[1] = (uint8_t)g_pending_move.stream;
+    put_u32(p + 2, (uint32_t)g_pending_move.x);
+    put_u32(p + 6, (uint32_t)g_pending_move.y);
+    send_input(p, sizeof p);
+    g_pending_move.valid = 0;
+}
+
+static void send_release_all(void) {
+    uint8_t p[1] = {IN_RELEASE_ALL};
+    g_pending_move.valid = 0;
+    send_input(p, 1);
+}
+
+static int stream_for_window(Uint32 window_id) {
+    for (int i = 0; i < g_nstreams; i++)
+        if (g_streams[i].win && SDL_GetWindowID(g_streams[i].win) == window_id) return i;
+    return -1;
+}
+
+static void set_mac_mode(int on) {
+    g_mac_mode = on;
+    if (on) {
+        // Bring up every Mac window, then focus the one on the monitor the cursor is on.
+        int gx, gy, focus = 0;
+        SDL_GetGlobalMouseState(&gx, &gy);
+        for (int i = 0; i < g_nstreams; i++) {
+            SDL_ShowWindow(g_streams[i].win);
+            SDL_Rect b;
+            SDL_GetDisplayBounds(g_streams[i].monitor, &b);
+            if (gx >= b.x && gx < b.x + b.w && gy >= b.y && gy < b.y + b.h) focus = i;
+            render_stream(&g_streams[i]);
+        }
+        SDL_RaiseWindow(g_streams[focus].win);
+        SDL_SetWindowKeyboardGrab(g_streams[focus].win, SDL_TRUE);
+        SDL_ShowCursor(SDL_DISABLE);
+    } else {
+        send_release_all();
+        for (int i = 0; i < g_nstreams; i++) {
+            SDL_SetWindowKeyboardGrab(g_streams[i].win, SDL_FALSE);
+            SDL_HideWindow(g_streams[i].win);
+        }
+        SDL_ShowCursor(SDL_ENABLE);
+    }
+    LOG("mode: %s", on ? "Mac" : "PC");
+}
+
+static void toggle_mode(void) {
+    Uint32 now = SDL_GetTicks();
+    if (now - g_last_toggle < 300) return;  // hotkey can arrive twice (system + window)
+    g_last_toggle = now;
+    set_mac_mode(!g_mac_mode);
+}
+
+static int mouse_button_index(Uint8 b) {
+    switch (b) {
+    case SDL_BUTTON_LEFT: return 0;
+    case SDL_BUTTON_RIGHT: return 1;
+    case SDL_BUTTON_MIDDLE: return 2;
+    case SDL_BUTTON_X1: return 3;
+    case SDL_BUTTON_X2: return 4;
+    default: return -1;
+    }
+}
+
+/// Handles keyboard/mouse events while in Mac mode. Returns 1 if the event was consumed.
+static int forward_input(const SDL_Event *ev) {
+    switch (ev->type) {
+    case SDL_MOUSEMOTION: {
+        int i = stream_for_window(ev->motion.windowID);
+        if (i < 0) return 0;
+        int ww, wh;
+        SDL_GetWindowSize(g_streams[i].win, &ww, &wh);
+        if (ww <= 0 || wh <= 0) return 1;
+        g_pending_move.valid = 1;
+        g_pending_move.stream = i;
+        g_pending_move.x = (int)((int64_t)ev->motion.x * g_streams[i].w / ww);
+        g_pending_move.y = (int)((int64_t)ev->motion.y * g_streams[i].h / wh);
+        return 1;
+    }
+    case SDL_MOUSEBUTTONDOWN:
+    case SDL_MOUSEBUTTONUP: {
+        int b = mouse_button_index(ev->button.button);
+        if (b < 0) return 1;
+        flush_mouse_move();
+        uint8_t p[3] = {IN_MOUSE_BUTTON, (uint8_t)b, ev->type == SDL_MOUSEBUTTONDOWN};
+        send_input(p, sizeof p);
+        return 1;
+    }
+    case SDL_MOUSEWHEEL: {
+        flush_mouse_move();
+        float dx = ev->wheel.preciseX, dy = ev->wheel.preciseY;
+        if (ev->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) { dx = -dx; dy = -dy; }
+        uint8_t p[9];
+        uint32_t ux, uy;
+        memcpy(&ux, &dx, 4);
+        memcpy(&uy, &dy, 4);
+        p[0] = IN_SCROLL;
+        put_u32(p + 1, ux);
+        put_u32(p + 5, uy);
+        send_input(p, sizeof p);
+        return 1;
+    }
+    case SDL_KEYDOWN:
+    case SDL_KEYUP: {
+        uint16_t code = mac_keycode(ev->key.keysym.scancode, g_pc_style_modifiers);
+        if (code == KEYMAP_NONE) return 1;
+        uint8_t p[5];
+        p[0] = IN_KEY;
+        put_u16(p + 1, code);
+        p[3] = ev->type == SDL_KEYDOWN;
+        p[4] = ev->key.repeat ? 1 : 0;
+        send_input(p, sizeof p);
+        return 1;
+    }
+    default:
+        return 0;
+    }
+}
 
 static void usage(void) {
     fprintf(stderr,
             "usage: softkvm HOST [--port P] [--monitor N[:WxH@FPS]]... [--sw-decode]\n"
+            "                    [--start-hidden] [--mac-modifiers]\n"
             "  Without --monitor every PC monitor gets a stream at its native mode (max 60 fps).\n"
-            "  Ctrl+Alt+Q quits.\n");
+            "  --mac-modifiers  Ctrl stays Control and the Windows key is Command\n"
+            "                   (default: Ctrl acts as Command, so Ctrl+C/V copy and paste).\n"
+            "  Ctrl+Alt+Space switches between Mac and PC. Ctrl+Alt+Q quits.\n");
 }
 
 static int add_monitor(const char *spec) {
@@ -488,6 +632,8 @@ int main(int argc, char **argv) {
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+    SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
+    SDL_SetHint(SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED, "0");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
@@ -499,6 +645,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--monitor") && i + 1 < argc) {
             if (add_monitor(argv[++i]) < 0) { usage(); return 1; }
         } else if (!strcmp(argv[i], "--sw-decode")) g_force_sw = 1;
+        else if (!strcmp(argv[i], "--start-hidden")) g_start_hidden = 1;
+        else if (!strcmp(argv[i], "--mac-modifiers")) g_pc_style_modifiers = 0;
         else if (argv[i][0] != '-' && !g_host[0]) snprintf(g_host, sizeof g_host, "%s", argv[i]);
         else { usage(); return 1; }
     }
@@ -544,23 +692,63 @@ int main(int argc, char **argv) {
         if (create_window(s, i) < 0) return 1;
     }
 
+    // Global hotkey: works in PC mode too, when our windows are hidden.
+    SDL_EventState(SDL_SYSWMEVENT, SDL_ENABLE);
+    SDL_StopTextInput();
+    {
+        SDL_SysWMinfo wm;
+        SDL_VERSION(&wm.version);
+        if (SDL_GetWindowWMInfo(g_streams[0].win, &wm) &&
+            RegisterHotKey(wm.info.win.window, HOTKEY_ID_TOGGLE, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE)) {
+            g_hotkey_registered = 1;
+            LOG("hotkey: Ctrl+Alt+Space registered");
+        } else {
+            LOG("hotkey: could not register Ctrl+Alt+Space globally (in use?); it only works in Mac mode");
+        }
+    }
+    set_mac_mode(!g_start_hidden);
+
     SDL_Thread *net = SDL_CreateThread(net_thread, "net", NULL);
 
     while (!SDL_AtomicGet(&g_quit)) {
         SDL_Event ev;
         if (!SDL_WaitEventTimeout(&ev, 100)) continue;
+        int check_focus = 0;
         do {
             if (ev.type == SDL_QUIT) {
                 SDL_AtomicSet(&g_quit, 1);
-            } else if (ev.type == SDL_KEYDOWN) {
-                SDL_Keymod mod = SDL_GetModState();
-                if (ev.key.keysym.sym == SDLK_q && (mod & KMOD_CTRL) && (mod & KMOD_ALT)) SDL_AtomicSet(&g_quit, 1);
-            } else if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_EXPOSED) {
-                for (int i = 0; i < g_nstreams; i++)
-                    if (SDL_GetWindowID(g_streams[i].win) == ev.window.windowID) render_stream(&g_streams[i]);
+            } else if (ev.type == SDL_SYSWMEVENT) {
+                if (ev.syswm.msg->msg.win.msg == WM_HOTKEY && ev.syswm.msg->msg.win.wParam == HOTKEY_ID_TOGGLE)
+                    toggle_mode();
+            } else if (ev.type == SDL_KEYDOWN && (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_ALT) &&
+                       (ev.key.keysym.sym == SDLK_q || ev.key.keysym.sym == SDLK_SPACE)) {
+                // Local hotkeys are never forwarded.
+                if (ev.key.keysym.sym == SDLK_q) SDL_AtomicSet(&g_quit, 1);
+                else if (!g_hotkey_registered) toggle_mode();
+            } else if (ev.type == SDL_WINDOWEVENT) {
+                if (ev.window.event == SDL_WINDOWEVENT_EXPOSED && g_mac_mode) {
+                    int i = stream_for_window(ev.window.windowID);
+                    if (i >= 0) render_stream(&g_streams[i]);
+                } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED && g_mac_mode) {
+                    SDL_Window *w = SDL_GetWindowFromID(ev.window.windowID);
+                    if (w) SDL_SetWindowKeyboardGrab(w, SDL_TRUE);
+                } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+                    check_focus = 1;
+                }
+            } else if (g_mac_mode) {
+                forward_input(&ev);
             }
         } while (SDL_PollEvent(&ev));
+        flush_mouse_move();
 
+        // Focus left our windows entirely (e.g. Ctrl+Alt+Del): lift keys held on the Mac.
+        if (check_focus && g_mac_mode && stream_for_window(SDL_GetKeyboardFocus()
+                ? SDL_GetWindowID(SDL_GetKeyboardFocus()) : 0) < 0) {
+            LOG("focus lost; releasing keys on the Mac");
+            send_release_all();
+        }
+
+        if (!g_mac_mode) continue;  // keep decoding in the background, draw when shown
         for (int i = 0; i < g_nstreams; i++) {
             SDL_LockMutex(g_streams[i].lock);
             int fresh = g_streams[i].has_new;
@@ -570,6 +758,7 @@ int main(int argc, char **argv) {
     }
 
     LOG("quitting");
+    send_release_all();
     SDL_LockMutex(g_send_lock);
     if (g_sock != INVALID_SOCKET) shutdown(g_sock, SD_BOTH);
     SDL_UnlockMutex(g_send_lock);

@@ -30,6 +30,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Accessibility lets us inject the client's keyboard and mouse. Prompts on first run.
+        Log.info("accessibility permission: \(InputInjector.checkPermission(prompt: true) ? "OK" : "missing")")
+
         let server = Server(bitrate: bitrateMbps * 1_000_000)
         do {
             try server.start()
