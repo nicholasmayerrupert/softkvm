@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define SK_PROTO_VERSION 1
+#define SK_PROTO_VERSION 2
 #define SK_MAX_HELLO 4096
 #define SK_TAG 16
 
@@ -49,6 +49,9 @@ size_t sk_seal(SkCipher *c, const uint8_t *plain, size_t len, uint8_t *out);
 /// Decrypts a record body (ciphertext ‖ tag, n bytes) in place. `header` is its 4-byte length.
 /// Returns the plaintext length, or -1 if authentication fails.
 long sk_open(SkCipher *c, const uint8_t header[4], uint8_t *body, size_t n);
+
+/// v2 commitment to a ClientHello: "SKVM", u16 proto, u16 0, SHA-512(hello). Returns 72.
+size_t sk_commit(const uint8_t *client_hello, size_t len, uint8_t out[72]);
 
 /// Short stable id for a public key: 16 hex chars + NUL.
 void sk_device_id(const uint8_t pub[32], char out[17]);

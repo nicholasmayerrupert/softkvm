@@ -87,7 +87,7 @@ final class TrustStore {
 /// Records: u32 LE length (ciphertext + 16) ‖ ChaCha20-Poly1305(ciphertext ‖ tag), nonce = 0u32 ‖ u64 LE counter,
 ///          associated data = the 4 length bytes.
 enum Handshake {
-    static let protocolVersion: UInt16 = 1
+    static let protocolVersion: UInt16 = 2
     static let magic = Data("SKVM".utf8)
     static let maxMessage = 4096
 
@@ -102,6 +102,23 @@ enum Handshake {
         var name: String
         var version: String
         var platform: UInt8
+    }
+
+    /// Commitment (v2): "SKVM", u16 proto, u16 0, SHA-512 of the ClientHello the client will send.
+    struct Commit { var proto: UInt16; var hash: Data }
+
+    static func decodeCommit(_ d: Data) -> Commit? {
+        guard d.count == 4 + 4 + 64, d.prefix(4) == magic, let proto = d.readLE(UInt16.self, at: 4) else { return nil }
+        return Commit(proto: proto, hash: d.subdata(in: (d.startIndex + 8)..<(d.startIndex + 72)))
+    }
+
+    /// A peer-supplied name made safe to show: no control characters, at most 40 characters.
+    static func displayName(_ raw: String) -> String {
+        let cleaned = String(raw.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
+                                .map(Character.init))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let short = cleaned.count > 40 ? String(cleaned.prefix(40)) + "…" : cleaned
+        return short.isEmpty ? "PC" : short
     }
 
     static func encode(_ h: Hello) -> Data {

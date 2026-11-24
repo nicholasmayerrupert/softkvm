@@ -11,6 +11,7 @@ typedef struct {
     int port;
     int platform;         // SK_PLATFORM_*
     int has_key;          // pub is known: from pairing, or seen in discovery before pairing
+    int paired;           // the user confirmed this device on both sides (pairing code)
     uint8_t pub[32];      // the device's identity key; connections must present it
     char monitors[512];   // ';'-separated PC monitor names to use for it; "" = all
 } Device;

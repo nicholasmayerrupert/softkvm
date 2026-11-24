@@ -98,7 +98,7 @@ final class Server: @unchecked Sendable {
 
     /// The handshake finished: decide whether this PC may connect.
     func authenticated(_ s: ClientSession) {
-        if TrustStore.shared.isTrusted(s.clientKey) {
+        if TrustStore.shared.isTrusted(s.clientKey) && !s.requestsPairing {
             admit(s, code: .ok)
             return
         }
@@ -233,7 +233,7 @@ final class Server: @unchecked Sendable {
 
 /// One connection: handshake, then encrypted messages.
 final class ClientSession: @unchecked Sendable {
-    enum State { case handshake, waitingForApproval, busy, authorized, streaming, closed }
+    enum State { case handshake, confirming, waitingForApproval, busy, authorized, streaming, closed }
 
     private let conn: NWConnection
     private let queue: DispatchQueue
@@ -244,6 +244,9 @@ final class ClientSession: @unchecked Sendable {
     private(set) var clientKey = Data()
     private(set) var clientName = "PC"
     private(set) var pairingCode = ""
+    /// The client doesn't know this Mac yet and asked to see the pairing prompt even if this Mac
+    /// already trusts it (so both screens show the code before it hands over control).
+    private(set) var requestsPairing = false
     private var cipher: RecordCipher?
 
     private var pipelines: [DisplayPipeline] = []
@@ -301,63 +304,91 @@ final class ClientSession: @unchecked Sendable {
         readHandshake()
         // Unauthenticated connections get 10 s to finish the handshake.
         queue.asyncAfter(deadline: .now() + 10) { [weak self] in
-            if self?.state == .handshake { self?.close(reason: "handshake timeout", keepDisplays: false) }
+            if self?.state == .handshake || self?.state == .confirming {
+                self?.close(reason: "handshake timeout", keepDisplays: false)
+            }
         }
     }
 
     // MARK: - Handshake
 
-    private func readHandshake() {
+    private func readFramed(_ done: @escaping (Data) -> Void) {
         receiveExactly(4) { [weak self] lenData in
             guard let self, let len = lenData.readLE(UInt32.self, at: 0), len > 0,
                   len <= UInt32(Handshake.maxMessage) else {
-                self?.close(reason: "not a SoftKVM v1 client", keepDisplays: false)
+                self?.close(reason: "not a SoftKVM client", keepDisplays: false)
                 return
             }
-            self.receiveExactly(Int(len)) { body in self.handleClientHello(body) }
+            self.receiveExactly(Int(len)) { body in done(body) }
         }
     }
 
-    private func handleClientHello(_ body: Data) {
-        guard let hello = Handshake.decode(body) else {
-            return close(reason: "malformed client hello", keepDisplays: false)
-        }
-        clientName = hello.name.isEmpty ? "PC" : hello.name
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
-        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
-        let status: Handshake.Status = hello.proto == Handshake.protocolVersion ? .ok : .versionMismatch
-        let hostHello = Handshake.encode(.init(
+    private func sendFramed(_ body: Data, then: ((NWError?) -> Void)? = nil) {
+        var framed = Data()
+        framed.appendLE(UInt32(body.count))
+        framed.append(body)
+        conn.send(content: framed, completion: .contentProcessed { error in then?(error) })
+    }
+
+    private var appVersion: String { Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev" }
+
+    private func hostHello(status: Handshake.Status, ephemeral: Curve25519.KeyAgreement.PrivateKey) -> Data {
+        Handshake.encode(.init(
             proto: Handshake.protocolVersion, status: status.rawValue, staticKey: Identity.publicKey,
             ephemeralKey: ephemeral.publicKey.rawRepresentation, name: server?.hostName ?? "Mac",
-            version: version, platform: Handshake.Platform.mac.rawValue))
-        var framed = Data()
-        framed.appendLE(UInt32(hostHello.count))
-        framed.append(hostHello)
+            version: appVersion, platform: Handshake.Platform.mac.rawValue))
+    }
 
-        guard status == .ok else {
-            Log.info("session: \(clientName) uses protocol v\(hello.proto) (app \(hello.version)); "
-                     + "this Mac speaks v\(Handshake.protocolVersion) (app \(version))")
-            conn.send(content: framed, completion: .contentProcessed { [weak self] _ in
-                self?.queue.async { self?.close(reason: "version mismatch", keepDisplays: false) }
-            })
-            return
+    /// v2 handshake: commitment → HostHello → ClientHello (checked against the commitment) →
+    /// keys → the client's first record (CONFIRM) proves it holds its private key.
+    private func readHandshake() {
+        readFramed { [weak self] first in
+            guard let self else { return }
+            if let commit = Handshake.decodeCommit(first), commit.proto == Handshake.protocolVersion {
+                self.handleCommit(commit.hash)
+                return
+            }
+            // Anything else is another protocol version (a v1 client sends its hello directly).
+            let theirs = Handshake.decodeCommit(first)?.proto ?? Handshake.decode(first)?.proto
+            let name = Handshake.decode(first)?.name ?? "a PC"
+            let theirVersion = Handshake.decode(first)?.version ?? "?"
+            Log.info("session: \(name) uses protocol v\(theirs.map(String.init) ?? "?") (app \(theirVersion)); "
+                     + "this Mac speaks v\(Handshake.protocolVersion) (app \(self.appVersion))")
+            self.sendFramed(self.hostHello(status: .versionMismatch, ephemeral: Curve25519.KeyAgreement.PrivateKey())) {
+                [weak self] _ in self?.queue.async { self?.close(reason: "version mismatch", keepDisplays: false) }
+            }
         }
-        conn.send(content: framed, completion: .contentProcessed { _ in })
+    }
 
-        do {
-            let keys = try Handshake.hostKeys(clientHello: body, hostHello: hostHello, client: hello,
-                                              hostEphemeral: ephemeral)
-            cipher = RecordCipher(keys: keys)
-            pairingCode = keys.pairingCode
-            clientKey = hello.staticKey
-        } catch {
-            return close(reason: "key agreement failed", keepDisplays: false)
+    private func handleCommit(_ commitment: Data) {
+        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
+        let hostHello = self.hostHello(status: .ok, ephemeral: ephemeral)
+        sendFramed(hostHello)
+        readFramed { [weak self] body in
+            guard let self else { return }
+            // The client chose its hello before seeing ours, so neither side can grind for a
+            // pairing code that matches another connection's.
+            guard Data(SHA512.hash(data: body)) == commitment else {
+                return self.close(reason: "client hello doesn't match its commitment", keepDisplays: false)
+            }
+            guard let hello = Handshake.decode(body), hello.proto == Handshake.protocolVersion else {
+                return self.close(reason: "malformed client hello", keepDisplays: false)
+            }
+            self.clientName = Handshake.displayName(hello.name)
+            do {
+                let keys = try Handshake.hostKeys(clientHello: body, hostHello: hostHello, client: hello,
+                                                  hostEphemeral: ephemeral)
+                self.cipher = RecordCipher(keys: keys)
+                self.pairingCode = keys.pairingCode
+                self.clientKey = hello.staticKey
+            } catch {
+                return self.close(reason: "key agreement failed", keepDisplays: false)
+            }
+            self.state = .confirming
+            Log.info("session: handshake with \(self.clientName) (\(deviceID(self.clientKey)), app \(hello.version)); "
+                     + "waiting for key confirmation")
+            self.readRecord()
         }
-        state = .waitingForApproval
-        Log.info("session: handshake done with \(clientName) (\(deviceID(clientKey)), app \(hello.version))")
-        readRecord()
-        startHeartbeat()
-        server?.authenticated(self)
     }
 
     private func receiveExactly(_ n: Int, _ done: @escaping (Data) -> Void) {
@@ -398,6 +429,18 @@ final class ClientSession: @unchecked Sendable {
         guard Proto.headerSize + len <= m.count else { return }
         let payload = m.subdata(in: (m.startIndex + Proto.headerSize)..<(m.startIndex + Proto.headerSize + len))
         let msg = Proto.MsgType(rawValue: type)
+
+        if state == .confirming {
+            // Key confirmation: the first record must be CONFIRM. Only a client holding the
+            // private key it presented can produce it, so nobody can pose as a paired PC.
+            guard msg == .confirm else { return close(reason: "no key confirmation", keepDisplays: false) }
+            requestsPairing = (payload.first ?? 0) & 1 != 0
+            state = .waitingForApproval
+            Log.info("session: \(clientName) confirmed its key\(requestsPairing ? "; it asks to pair" : "")")
+            startHeartbeat()
+            server?.authenticated(self)
+            return
+        }
 
         switch msg {
         case .goodbye:

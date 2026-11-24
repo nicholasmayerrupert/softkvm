@@ -12,14 +12,14 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-PROTO = 1
+PROTO = 2
 INFO = b"SoftKVM v1 session"
 PLATFORM_WINDOWS, PLATFORM_MAC, PLATFORM_LINUX = 1, 2, 3
 
 # message types (inside the encrypted channel)
 HELLO_ACK, STREAM_INFO, VIDEO, AUDIO, PING, LAYOUT, CURSOR, CURSOR_POS = 1, 2, 3, 4, 5, 6, 7, 8
 SET_MONITORS, BYE, AUTH_STATUS = 9, 0x0A, 0x0B
-HELLO, KEYFRAME_REQUEST, MONITORS, TAKEOVER, GOODBYE, INPUT = 0x81, 0x82, 0x83, 0x84, 0x85, 0x90
+HELLO, KEYFRAME_REQUEST, MONITORS, TAKEOVER, GOODBYE, CONFIRM, INPUT = 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x90
 AUTH_NAMES = {0: "ok", 1: "pairing pending", 2: "pairing denied", 3: "busy", 4: "paired"}
 
 
@@ -70,21 +70,28 @@ def nonce(ctr):
 class Channel:
     """Encrypted client connection to a SoftKVM host."""
 
-    def __init__(self, host, port=47900, identity=None, name="python-client", version="dev", timeout=15):
+    def __init__(self, host, port=47900, identity=None, name="python-client", version="dev", timeout=15,
+                 request_pairing=False, commit_override=None):
+        """request_pairing: ask the host to show its pairing prompt even if it trusts us.
+        commit_override: test hook, send this commitment instead of the real one."""
         self.static = identity or X25519PrivateKey.generate()
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         eph = X25519PrivateKey.generate()
         ch = encode_hello(PROTO, 0, pub_raw(self.static), pub_raw(eph), name, version, PLATFORM_LINUX)
-        self.sock.sendall(struct.pack("<I", len(ch)) + ch)
+        # v2: commit to our hello before seeing the host's, so neither side can grind the code.
+        commit = b"SKVM" + struct.pack("<HH", PROTO, 0) + (commit_override or hashlib.sha512(ch).digest())
+        self.sock.sendall(struct.pack("<I", len(commit)) + commit)
         (n,) = struct.unpack("<I", self._recv(4))
         hh = self._recv(n)
         self.host = decode_hello(hh)
         if self.host["status"] != 0 or self.host["proto"] != PROTO:
             raise RuntimeError(f"version mismatch: host speaks v{self.host['proto']} (app {self.host['version']})")
+        self.sock.sendall(struct.pack("<I", len(ch)) + ch)
         k_send, k_recv, self.code = derive_client(ch, hh, self.static, eph, self.host)
         self.send_aead, self.recv_aead = ChaCha20Poly1305(k_send), ChaCha20Poly1305(k_recv)
         self.send_ctr = self.recv_ctr = 0
+        self.send(CONFIRM, bytes([1 if request_pairing else 0]))  # key confirmation
 
     def _recv(self, n):
         buf = bytearray()

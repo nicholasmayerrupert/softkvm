@@ -51,8 +51,10 @@ void config_load(Config *c) {
     Device legacy = {0};
     int has_legacy = 0;
     Device *d = NULL;
+    int seen_paired = 0;
     while (fgets(line, sizeof line, f)) {
         line[strcspn(line, "\r\n")] = 0;
+        if (!strncmp(line, "paired=", 7)) seen_paired = 1;
         if (!strcmp(line, "[device]")) {
             d = c->ndevices < CFG_MAX_DEVICES ? &c->devices[c->ndevices++] : NULL;
             if (d) memset(d, 0, sizeof *d), d->port = DEFAULT_PORT;
@@ -68,6 +70,7 @@ void config_load(Config *c) {
             else if (!strcmp(k, "port")) d->port = atoi(v) > 0 ? atoi(v) : DEFAULT_PORT;
             else if (!strcmp(k, "platform")) d->platform = atoi(v);
             else if (!strcmp(k, "pub")) d->has_key = hex_decode(v, d->pub, 32) == 0;
+            else if (!strcmp(k, "paired")) d->paired = atoi(v) != 0;
             else if (!strcmp(k, "monitors")) set_str(d->monitors, sizeof d->monitors, v);
         } else {
             if (!strcmp(k, "pc_style_modifiers")) c->pc_style_modifiers = atoi(v) != 0;
@@ -80,6 +83,8 @@ void config_load(Config *c) {
         }
     }
     fclose(f);
+    if (!seen_paired)  // 0.2.0 configs: devices with a stored key were paired then
+        for (int i = 0; i < c->ndevices; i++) c->devices[i].paired = c->devices[i].has_key;
     if (has_legacy && c->ndevices == 0) {
         if (!legacy.port) legacy.port = DEFAULT_PORT;
         legacy.platform = 2;
@@ -101,8 +106,8 @@ void config_save(const Config *c) {
         const Device *d = &c->devices[i];
         char pub[65] = "";
         if (d->has_key) hex_encode(d->pub, 32, pub);
-        fprintf(f, "\n[device]\nname=%s\naddr=%s\nport=%d\nplatform=%d\npub=%s\nmonitors=%s\n", d->name, d->addr,
-                d->port, d->platform, pub, d->monitors);
+        fprintf(f, "\n[device]\nname=%s\naddr=%s\nport=%d\nplatform=%d\npub=%s\npaired=%d\nmonitors=%s\n", d->name,
+                d->addr, d->port, d->platform, pub, d->paired, d->monitors);
     }
     fclose(f);
     MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING);  // atomic-ish: never leave a half-written file

@@ -63,6 +63,7 @@ enum {
     MSG_MONITORS = 0x83,
     MSG_TAKEOVER = 0x84,
     MSG_GOODBYE = 0x85,
+    MSG_CONFIRM = 0x86,
     MSG_INPUT = 0x90,
 };
 
@@ -118,6 +119,8 @@ static SDL_atomic_t g_net_stop;
 static SDL_atomic_t g_connected;
 static SDL_atomic_t g_session_gen;
 static SDL_atomic_t g_paused;  // disconnected on purpose: don't reconnect until the user asks
+static SDL_atomic_t g_local_consent;  // pairing a new device: 0 asked, 1 user said yes, -1 no
+static int g_code_asking;              // the pairing window is waiting for that answer (main thread)
 static int g_want_mac_on_connect;
 static Uint32 g_cmd_event, g_net_event;
 
@@ -601,7 +604,11 @@ static int client_handshake(SOCKET s, int gen) {
     uint8_t cbuf[SK_MAX_HELLO + 4], hbuf[SK_MAX_HELLO];
     size_t cl = sk_hello_encode(&ch, cbuf + 4, SK_MAX_HELLO);
     put_u32(cbuf, (uint32_t)cl);
-    if (send_all(s, cbuf, (int)(cl + 4)) < 0) return -1;
+    // v2: commit to our hello before seeing the device's, so neither side can grind the code.
+    uint8_t commit[4 + 72];
+    put_u32(commit, 72);
+    sk_commit(cbuf + 4, cl, commit + 4);
+    if (send_all(s, commit, sizeof commit) < 0) return -1;
 
     uint8_t lenb[4];
     if (recv_all(s, lenb, 4) < 0) return -1;
@@ -629,10 +636,15 @@ static int client_handshake(SOCKET s, int gen) {
         post_net(gen, NE_KEY_CHANGED, 0, NULL, &hh);
         return -1;
     }
+    if (send_all(s, cbuf, (int)(cl + 4)) < 0) return -1;  // reveal the hello we committed to
     SDL_LockMutex(g_send_lock);
     sk_client_keys(&g_cipher, cbuf + 4, cl, hbuf, hl, &g_identity, &eph, &hh);
     SDL_UnlockMutex(g_send_lock);
     sk_wipe(&eph, sizeof eph);
+    // Key confirmation (and, for a device we haven't paired with, ask it to show its pairing
+    // prompt even if it already trusts this PC, so the user confirms the code on both screens).
+    uint8_t flags = g_session_dev.paired ? 0 : 1;
+    if (send_msg(MSG_CONFIRM, 0, &flags, 1) < 0) return -1;
     char id[17];
     sk_device_id(hh.static_pub, id);
     LOG("net: secure channel to %s (%s, SoftKVM %s)", hh.name, id, hh.version);
@@ -672,7 +684,9 @@ static int net_thread(void *unused) {
         SDL_LockMutex(g_send_lock);
         g_sock = s;
         SDL_UnlockMutex(g_send_lock);
-        int authorized = 0;
+        int authorized = 0, host_ok = 0, got_paired = 0;
+        int need_consent = !g_session_dev.paired;  // a new device: the user must confirm the code here too
+        SDL_AtomicSet(&g_local_consent, 0);
         if (net_should_stop() || client_handshake(s, gen) < 0) goto disconnected;
 
         for (;;) {
@@ -711,18 +725,26 @@ static int net_thread(void *unused) {
                 }
                 switch (msg[0]) {
                 case AUTH_OK:
-                    authorized = 1;
-                    LOG("net: authorized");
-                    perf_connected();
-                    if (send_hello() < 0 || send_monitors() < 0) goto disconnected;
+                    if (need_consent && !got_paired) {
+                        // We asked a new device to show its pairing prompt and it skipped it:
+                        // not a SoftKVM we can trust with the keyboard.
+                        LOG("net: the device skipped pairing confirmation; refusing");
+                        SDL_AtomicSet(&g_paused, 1);
+                        post_net(gen, NE_KEY_CHANGED, 1, NULL, NULL);
+                        goto disconnected;
+                    }
+                    host_ok = 1;
+                    perf_connected();  // time sync keeps the link alive while we wait for consent
+                    LOG(need_consent ? "net: approved on the device; waiting for confirmation here" : "net: authorized");
                     break;
                 case AUTH_PAIRED:
                     LOG("net: paired");
+                    got_paired = 1;
                     post_net(gen, NE_PAIRED, 0, NULL, NULL);
                     break;
                 case AUTH_PAIRING_PENDING:
                     LOG("net: waiting for approval on the device (code %s)", g_cipher.code);
-                    post_net(gen, NE_PAIRING, 0, g_cipher.code, NULL);
+                    post_net(gen, NE_PAIRING, need_consent, g_cipher.code, NULL);
                     break;
                 case AUTH_PAIRING_DENIED:
                     LOG("net: pairing was refused on the device");
@@ -749,6 +771,19 @@ static int net_thread(void *unused) {
                 if (reason != BYE_HOST_QUITTING) SDL_AtomicSet(&g_paused, 1);
                 post_net(gen, NE_BYE, reason, text, NULL);
                 goto disconnected;
+            }
+            if (host_ok && !authorized) {
+                int consent = need_consent ? SDL_AtomicGet(&g_local_consent) : 1;
+                if (consent < 0) {
+                    LOG("net: pairing cancelled on this PC");
+                    SDL_AtomicSet(&g_paused, 1);
+                    post_net(gen, NE_DENIED, 1, NULL, NULL);
+                    goto disconnected;
+                }
+                if (consent > 0) {
+                    authorized = 1;
+                    if (send_hello() < 0 || send_monitors() < 0) goto disconnected;
+                }
             }
             if (!authorized) continue;
             if (perf_handle_msg(type, stream, msg, len, done_us)) continue;  // latency instrumentation
@@ -1420,6 +1455,7 @@ static void stop_session(int goodbye) {
     }
     if (!g_cli_monitors) g_nstreams = 0;
     reset_remote_state();
+    g_code_asking = 0;
     tray_hide_code();
 }
 
@@ -1675,6 +1711,10 @@ static void handle_command(int cmd, int arg) {
     case CMD_RECONNECT:
         use_active_device();
         break;
+    case CMD_LOCAL_CONSENT:
+        g_code_asking = 0;
+        SDL_AtomicSet(&g_local_consent, arg ? 1 : -1);
+        break;
     case CMD_GO_TO_PC:
         if (g_mac_mode) set_mac_mode(0);
         break;
@@ -1789,21 +1829,24 @@ static void handle_net_event(NetEvent *e) {
         break;
     case NE_PAIRING:
         set_dev_state(i, DEV_PAIRING, e->text);
-        tray_show_code(d->name, e->text);
+        g_code_asking = e->arg;
+        tray_show_code(d->name, e->text, e->arg);
         break;
     case NE_PAIRED:
-        tray_hide_code();
+        if (!g_code_asking) tray_hide_code();  // otherwise it stays until the user answers here
         snprintf(msg, sizeof msg, "%s approved this PC.", d->name);
         tray_notify("Paired", msg);
         break;
     case NE_DENIED:
         tray_hide_code();
-        set_dev_state(i, DEV_PAUSED, "pairing refused on the device");
-        snprintf(msg, sizeof msg, "%s refused to pair with this PC.", d->name);
-        tray_notify("Not paired", msg);
+        set_dev_state(i, DEV_PAUSED, e->arg ? "pairing cancelled" : "pairing refused on the device");
+        if (!e->arg) {
+            snprintf(msg, sizeof msg, "%s refused to pair with this PC.", d->name);
+            tray_notify("Not paired", msg);
+        }
         break;
     case NE_BUSY:
-        tray_hide_code();
+        if (!g_code_asking) tray_hide_code();
         set_dev_state(i, DEV_BUSY, e->text);
         if (g_want_mac_on_connect) offer_takeover();  // the user just asked for this device
         break;
@@ -1814,6 +1857,7 @@ static void handle_net_event(NetEvent *e) {
         // Remember the device: the key its handshake proved, and its real name.
         memcpy(d->pub, g_last_host.pub, 32);
         d->has_key = 1;
+        d->paired = 1;
         d->platform = g_last_host.platform;
         if (!strcmp(d->name, d->addr) && g_last_host.text[0]) snprintf(d->name, sizeof d->name, "%s", g_last_host.text);
         SDL_LockMutex(g_shared_lock);
@@ -1858,6 +1902,13 @@ static void handle_net_event(NetEvent *e) {
         tray_notify("Version mismatch", msg);
         break;
     case NE_KEY_CHANGED:
+        if (e->arg) {  // skipped the pairing prompt we asked for
+            set_dev_state(i, DEV_ERROR, "didn't confirm pairing — not trusted");
+            snprintf(msg, sizeof msg, "The device at %s answered without showing a pairing code. "
+                     "SoftKVM didn't connect to it.", d->addr);
+            tray_notify("Security warning", msg);
+            break;
+        }
         set_dev_state(i, DEV_ERROR, "its identity changed — forget it and add it again");
         snprintf(msg, sizeof msg,
                  "The device at %s isn't the %s this PC paired with (it may have been reinstalled). "

@@ -40,6 +40,9 @@ enum Proto {
         case takeover = 0x84
         /// The client is leaving on purpose: u8 reason (0 quitting, 1 switching to another device).
         case goodbye = 0x85
+        /// First record after the handshake (key confirmation): u8 flags, bit 0 = "show the
+        /// pairing prompt even if you already trust me" (the client doesn't know this Mac yet).
+        case confirm = 0x86
         case input = 0x90
     }
 

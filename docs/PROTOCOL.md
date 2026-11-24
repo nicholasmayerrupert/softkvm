@@ -1,4 +1,4 @@
-# SoftKVM protocol (v1)
+# SoftKVM protocol (v2)
 
 All integers are little-endian. "str" means `u8 length` followed by that many UTF-8 bytes.
 The **host** is the controlled machine (a Mac today); the **client** is the PC.
@@ -25,9 +25,15 @@ Hello = "SKVM" | u16 protocol | u16 status | 32 static public key | 32 ephemeral
         | str name | str app_version | u8 platform
 ```
 
-1. Client → host: `ClientHello` (status 0).
+1. Client → host: **commitment** = `"SKVM" | u16 protocol | u16 0 | SHA-512(ClientHello)` (72 bytes).
 2. Host → client: `HostHello`. Status 1 = version mismatch (the host closes; the client shows "update
-   needed" with both versions).
+   needed" with both versions). A first message that isn't a v2 commitment (e.g. a v1 ClientHello)
+   gets this answer.
+3. Client → host: `ClientHello` (status 0). The host closes unless its SHA-512 equals the commitment.
+
+Because the client commits to its hello before seeing the host's, and the host sends its hello before
+seeing the client's, neither side can try many hellos to make the 6-digit pairing code match another
+connection's (a man in the middle would otherwise grind ~10⁶ candidates).
 
 Both sides then derive keys:
 
@@ -39,8 +45,10 @@ client→host key = okm[0:32]   host→client key = okm[32:64]
 pairing code    = u32(okm[64:68]) mod 1 000 000, shown as "123 456"
 ```
 
-Only a party holding the static private key it advertised can derive the keys, so a successful first
-record proves both identities. Clients pin a device's key once paired. A device presenting a
+**Key confirmation.** The client's first record must be `CONFIRM`, and the host's first is
+`AUTH_STATUS`. Only a party holding the static private key it advertised can derive the keys, so these
+two records prove both identities. The host decides nothing about a client until its `CONFIRM`
+decrypts: knowing a paired PC's *public* key gets an impostor nowhere. Clients pin a device's key once paired. A device presenting a
 different key is refused ("its identity changed").
 
 ## Records
@@ -60,6 +68,12 @@ A record that fails authentication ends the connection.
 ```
 u8 type | u8 stream | u16 reserved | u32 payload_length | payload
 ```
+
+### Key confirmation (first client message)
+
+`CONFIRM (0x86)`: `u8 flags`. Bit 0 = *pair with me*: the client hasn't confirmed this device with its
+user yet, so the host shows its pairing prompt even if it already trusts the client. The client then
+also asks its own user to confirm the code, and refuses a host that answers `OK` without `PAIRED`.
 
 ### Authorization (first host message)
 
@@ -83,13 +97,15 @@ Before `OK`, the host only accepts `TAKEOVER` and `GOODBYE`.
 | `0x02` | STREAM_INFO | `u32 width, height, fps, codec` (1 HEVC, 2 H.264) |
 | `0x03` | VIDEO | `u64 pts_us, u8 flags` (bit 0 = keyframe), Annex B access unit |
 | `0x04` | AUDIO | `u64 pts_us`, s16le stereo PCM @ 48 kHz |
-| `0x05` | PING | (empty) every second; clients reconnect after ~4 s of silence |
+| `0x05` | PING | every second, optionally `u64 host_us` (host clock, starts time sync). Clients reconnect after ~4 s of silence. |
 | `0x06` | LAYOUT | `u32 n`, n × `u8 stream (0xFF = not streamed), u8[3], i32 x, y, w, h`: every host display, global points |
 | `0x07` | CURSOR | `i32 hot_x, hot_y, u32 w, h`, w×h RGBA (straight alpha): on shape change |
 | `0x08` | CURSOR_POS | `f32 x, y` global points: when something else moved the cursor |
 | `0x09` | SET_MONITORS | `u32 mask`: the host's user picked these client monitors (bit i = monitor i). The client reconnects with them. |
 | `0x0A` | BYE | `u8 reason, str text`: 0 disconnected by the host's user, 1 taken over (text = by whom), 2 unpaired, 3 host quitting. Except for 3, the client doesn't reconnect until its user asks. |
 | `0x0B` | AUTH_STATUS | see above |
+| `0x20` | FRAME_TIMING | latency instrumentation, see docs/DEVELOPMENT.md |
+| `0x21` | TIME_RESPONSE | `u64 client_us` (echo), `u64 host_us` |
 
 ### Client → host
 
@@ -99,6 +115,8 @@ Before `OK`, the host only accepts `TAKEOVER` and `GOODBYE`.
 | `0x82` | KEYFRAME_REQUEST | (empty; `stream` selects the display) |
 | `0x83` | MONITORS | `str client name, u8 n`, n × `u8 index, u8 selected, u32 w, h, hz, str name`: every client monitor |
 | `0x84` | TAKEOVER | (empty) after `BUSY`: take control from the client in control |
+| `0x86` | CONFIRM | `u8 flags`, first record (see above) |
+| `0xA0` | TIME_REQUEST | `u64 client_us`. Clients send it every second once authorized; the host drops an authorized client silent for 5 s. |
 | `0x85` | GOODBYE | `u8 reason`: 0 quitting (host removes its displays), 1 switching to another device (host keeps them for a while) |
 | `0x90` | INPUT | `u8 kind` + fields, see below |
 

@@ -113,6 +113,14 @@ long sk_open(SkCipher *c, const uint8_t header[4], uint8_t *body, size_t n) {
     return (long)len;
 }
 
+size_t sk_commit(const uint8_t *client_hello, size_t len, uint8_t out[72]) {
+    memcpy(out, "SKVM", 4);
+    put16(out + 4, SK_PROTO_VERSION);
+    put16(out + 6, 0);
+    crypto_sha512(out + 8, client_hello, len);
+    return 72;
+}
+
 void sk_device_id(const uint8_t pub[32], char out[17]) {
     uint8_t h[64];
     crypto_sha512(h, pub, 32);

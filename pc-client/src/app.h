@@ -71,6 +71,7 @@ enum {
     CMD_ADD_DEVICE,       // arg = index into available
     CMD_FORGET_DEVICE,    // arg = device index
     CMD_GO_TO_PC,         // leave Mac mode (e.g. the PC is suspending)
+    CMD_LOCAL_CONSENT,    // arg = 1 the user confirmed the pairing code on this PC, 0 cancelled
 };
 
 void app_snapshot(AppSnapshot *out);

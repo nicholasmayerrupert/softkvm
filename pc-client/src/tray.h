@@ -11,5 +11,6 @@ int tray_hotkey_registered(void);
 /// Balloon notification from the tray icon.
 void tray_notify(const char *title, const char *text);
 /// Shows (or replaces) a window with the pairing code to compare on the device.
-void tray_show_code(const char *device, const char *code);
+/// With ask, the window has OK/Cancel and reports the answer as CMD_LOCAL_CONSENT.
+void tray_show_code(const char *device, const char *code, int ask);
 void tray_hide_code(void);

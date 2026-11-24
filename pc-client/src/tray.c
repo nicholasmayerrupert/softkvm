@@ -203,25 +203,36 @@ void tray_notify(const char *title, const char *text) {
 }
 
 static const wchar_t *CODE_TITLE = L"SoftKVM — pairing";
-static wchar_t g_code_text[512];
+static wchar_t g_code_text[600];
+static volatile LONG g_code_box_gen;  // bumped when we close the box ourselves
 
-static DWORD WINAPI code_box_thread(LPVOID unused) {
-    (void)unused;
-    MessageBoxW(NULL, g_code_text, CODE_TITLE, MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST);
+static DWORD WINAPI code_box_thread(LPVOID param) {
+    int ask = (int)(INT_PTR)param;
+    LONG gen = g_code_box_gen;
+    int r = MessageBoxW(NULL, g_code_text, CODE_TITLE,
+                        (ask ? MB_OKCANCEL | MB_ICONQUESTION : MB_OK | MB_ICONINFORMATION) | MB_SETFOREGROUND |
+                            MB_TOPMOST);
+    if (ask && gen == g_code_box_gen) app_post_command(CMD_LOCAL_CONSENT, r == IDOK);
     return 0;
 }
 
-void tray_show_code(const char *device, const char *code) {
+void tray_show_code(const char *device, const char *code, int ask) {
     tray_hide_code();
-    char text[512];
-    snprintf(text, sizeof text,
-             "Approve this PC on “%s”.\n\nCheck that it shows the same code:\n\n        %s\n\n"
-             "This closes by itself once you approve.", device, code);
-    utf8_to_wide(text, g_code_text, 512);
-    CloseHandle(CreateThread(NULL, 0, code_box_thread, NULL, 0, NULL));
+    char text[600];
+    if (ask)
+        snprintf(text, sizeof text,
+                 "Pair with “%s”?\n\nCheck that it shows this same code:\n\n        %s\n\n"
+                 "Click Allow on that device, then OK here. Cancel if the codes don't match.", device, code);
+    else
+        snprintf(text, sizeof text,
+                 "Approve this PC on “%s”.\n\nCheck that it shows the same code:\n\n        %s\n\n"
+                 "This closes by itself once you approve.", device, code);
+    utf8_to_wide(text, g_code_text, 600);
+    CloseHandle(CreateThread(NULL, 0, code_box_thread, (LPVOID)(INT_PTR)ask, 0, NULL));
 }
 
 void tray_hide_code(void) {
+    InterlockedIncrement(&g_code_box_gen);  // a box we close ourselves doesn't count as an answer
     HWND box = FindWindowW(L"#32770", CODE_TITLE);
     if (box) PostMessageW(box, WM_CLOSE, 0, 0);
 }
