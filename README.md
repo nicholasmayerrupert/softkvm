@@ -1,96 +1,78 @@
 # SoftKVM
 
-A software KVM: use your PC's monitors, keyboard and mouse to drive a Mac.
+A software KVM: use your PC's monitors, keyboard and mouse to control your other computers (Macs today;
+Linux is planned).
 
-The Mac creates virtual displays matching the PC's monitors and streams each one, hardware-encoded,
-to a fullscreen window on the matching PC monitor. Keyboard and mouse input flows back to the Mac.
-One hotkey on the PC flips between "Mac mode" and "PC mode".
+Each Mac creates virtual displays matching the PC's monitors and streams them, hardware-encoded, to
+fullscreen windows on those monitors. The PC draws the cursor locally and sends keyboard and mouse
+back. One hotkey flips between the PC and the device you're controlling; another picks the device.
 
 ```
- ┌──────────── Mac ────────────┐           ┌──────────── PC ─────────────┐
- │ virtual display 1 ─┐        │  LAN/TCP  │        ┌─ fullscreen window 1 │
- │ virtual display 2 ─┤ HEVC ──┼──────────►│ decode ┤                      │
- │                    │encoder │           │ (GPU)  └─ fullscreen window 2 │
- │ CGEvent injection ◄┼────────┼───────────┤ keyboard/mouse capture       │
- └─────────────────────────────┘           └──────────────────────────────┘
+ ┌──────────── Mac ────────────┐            ┌──────────── PC ──────────────┐
+ │ virtual display 1 ─┐        │ encrypted  │        ┌─ fullscreen window 1 │
+ │ virtual display 2 ─┤ HEVC ──┼───────────►│ decode ┤                      │
+ │ system audio       │encoder │    TCP     │ (GPU)  └─ fullscreen window 2 │
+ │ CGEvent injection ◄┼────────┼────────────┤ keyboard/mouse, local cursor │
+ └─────────────────────────────┘            └──────────────────────────────┘
 ```
 
-## Layout
+## Install
+
+| Machine | Get | Then |
+|---|---|---|
+| **Mac** (macOS 14+, Apple Silicon) | `SoftKVM-Host-<version>.dmg` (`mac-host/package.sh`) | Drag **SoftKVM Host** to Applications, open it, grant **Screen Recording** and **Accessibility**. Turn on **Launch at Login** from its menu. |
+| **PC** (Windows 10/11) | `SoftKVM-Setup-<version>.exe` (`pc-client/package.sh`) | Run it (no admin needed). It installs to `%LOCALAPPDATA%\Programs\SoftKVM`, adds a Start menu entry and (optionally) starts with Windows. |
+
+The builds aren't signed with a distribution certificate yet, so on a new machine Windows SmartScreen
+("More info → Run anyway") and macOS Gatekeeper (right-click → Open) will ask once.
+
+## Use
+
+**Pairing.** The first time a PC connects to a Mac, the Mac asks *"Allow ‹PC› to control this Mac?"*
+and both show the same 6-digit code. Approve only if the codes match. After that the PC reconnects by
+itself. Everything between paired devices is encrypted.
+
+**PC (tray icon near the clock, blue when connected):**
+- **Devices:** each paired device with its state (online, connected, in use by another PC, …).
+  Click one, or press **Ctrl+Alt+1…9**, to control it.
+- **Ctrl+Alt+Space:** switch between this PC and the active device.
+- **Monitors for ‹device›:** which PC monitors show that device (one Mac display per checked monitor).
+  Remembered per device.
+- **Add a device:** devices found on your network. **Forget a device** removes a pairing.
+- **Keyboard:** Ctrl acts as Cmd (PC style, default) or the Windows key does (Mac style).
+- **Start with Windows**, **Open log**, **Quit**. **Ctrl+Alt+Q** quits while controlling a device.
+
+**Mac (menu-bar icon):** connection status, the PC's monitors (same checkboxes), **Paired PCs**
+(Forget), **Video quality**, **Disconnect PC**, **Permissions**, **Launch at Login**, **Open Log**.
+
+**One PC at a time.** If another PC is controlling a Mac, the device shows "in use by ‹PC›"; clicking
+it offers to take over. A Mac you disconnect from its menu stays disconnected until you reconnect from
+the PC.
+
+**Good to know**
+- The Mac keeps its virtual displays for 15 minutes after an unexpected disconnect (PC asleep, network
+  blip), so windows stay where they were when the PC comes back.
+- The Mac won't idle-sleep while a PC is connected.
+- If a device's address changes (e.g. Wi-Fi → Ethernet), the PC finds it again by its identity.
+- Wired Ethernet on the Mac makes the biggest difference to latency and smoothness.
+
+## How it works
 
 | Path | What |
 |---|---|
-| `mac-host/` | Swift app (macOS 14+, Apple Silicon). Virtual displays, ScreenCaptureKit capture, VideoToolbox encode, input injection. |
-| `pc-client/` | Windows client in C. FFmpeg (D3D11VA) decode, SDL2 windows per monitor, input capture, hotkey. |
-| `tools/` | Dev helpers, e.g. a Python receiver that dumps the stream to a file for testing. |
+| `mac-host/` | Swift menu-bar app. Virtual displays (private `CGVirtualDisplay` API), ScreenCaptureKit capture, VideoToolbox HEVC, system audio, CGEvent input, pairing UI. |
+| `pc-client/` | Windows client in C. SDL2 windows per monitor, FFmpeg D3D11VA decode, raw mouse + local cursor, tray UI, NSIS installer. |
+| `tools/` | Python implementation of the protocol (`softkvm_proto.py`), a test client (`recv.py`), deploy scripts. |
+| `docs/PROTOCOL.md` | Wire protocol: discovery, handshake, encryption, messages. |
+| `docs/DEVELOPMENT.md` | Building, deploying and testing (for people and agents). |
 
-## Status
-
-- [x] Milestone 1: Mac virtual displays → PC windows (tested with two displays)
-- [ ] Milestone 2: keyboard/mouse forwarding + Mac/PC hotkey
-- [x] Milestone 3: two displays
-- [x] Audio (system audio, uncompressed PCM)
-- [ ] Milestone 4: clipboard, auto-reconnect, start on login
-
-## Protocol (v0)
-
-One TCP connection, Mac listens on port **47900**. All integers little-endian.
-
-Every message: `u8 type | u8 stream | u16 reserved | u32 payload_len | payload`
-
-Host → client
-
-| type | name | payload |
-|---|---|---|
-| `0x01` | HELLO_ACK | `u32 version, u8 len, Mac name` |
-| `0x02` | STREAM_INFO | `u32 width, u32 height, u32 fps, u32 codec` (1 = HEVC, 2 = H.264) |
-| `0x03` | VIDEO | `u64 pts_us, u8 flags` (bit 0 = keyframe), then Annex B bitstream |
-| `0x05` | PING | (empty) sent every second; clients reconnect after ~4 s of silence |
-| `0x06` | LAYOUT | `u32 n`, then n × `u8 stream (0xFF = not streamed), u8[3], i32 x, y, w, h` — every Mac display in global points |
-| `0x07` | CURSOR | `i32 hot_x, hot_y, u32 w, h`, then w×h RGBA (straight alpha) — sent when the cursor shape changes |
-| `0x09` | SET_MONITORS | `u32 mask` — the Mac's menu asks the PC to use these monitors (bit i = monitor i); the PC reconnects |
-| `0x0A` | BYE | (empty) deliberate disconnect from the Mac's menu; the client stays disconnected until its user reconnects |
-| `0x08` | CURSOR_POS | `f32 x, y` global points — when something other than the client moved the cursor |
-| `0x04` | AUDIO | `u64 pts_us`, then s16le stereo PCM @ 48 kHz (system audio) |
-
-Client → host
-
-| type | name | payload |
-|---|---|---|
-| `0x81` | HELLO | `u32 version, u32 n`, then n × `u32 width, u32 height, u32 fps`, then optionally n × `i32 x, y` (each PC monitor's desktop origin, used to arrange the Mac's displays alike) |
-| `0x83` | MONITORS | `u8 len, PC name, u8 n`, then n × `u8 index, u8 selected, u32 w, h, hz, u8 len, name` — every PC monitor, sent after HELLO |
-| `0x82` | KEYFRAME_REQUEST | (empty; `stream` field selects the display) |
-| `0x90` | INPUT | first byte = kind; see `mac-host/Sources/SoftKVMHost/InputInjector.swift` |
-
-**Discovery:** clients broadcast `SOFTKVM_DISCOVER` to UDP **47901**; hosts reply `SOFTKVM_HOST`, `u16` TCP port, then the Mac's name.
-
-## Using it
-
-**Mac:** run **SoftKVM Host** from Applications. Its menu-bar icon shows whether a PC is connected and has:
-- **Use these PC monitors for the Mac:** one checkbox per PC monitor. Each checked monitor gets one Mac virtual display.
-- **Video quality**, **Disconnect PC**, **Permissions**, **Launch at Login**, **Open Log**, **Quit**.
-
-**PC:** run `softkvm.exe` (no arguments needed). It finds the Mac on the LAN by itself. The tray icon (blue when connected) has:
-- **Switch to Mac / PC** (also **Ctrl+Alt+Space**).
-- **Mac displays:** the same per-monitor checkboxes.
-- **Mac:** choose which Mac to connect to, or search again.
-- **Keyboard:** Ctrl as Cmd (PC style) or the Windows key as Cmd (Mac style).
-- **Start with Windows**, **Open log**, **Quit** (also **Ctrl+Alt+Q** in Mac mode).
-
-Settings are saved in `%APPDATA%\SoftKVM\config.ini`; the log is next to `softkvm.exe`.
+Settings: PC `%APPDATA%\SoftKVM\config.ini` and `identity.dat` (DPAPI); Mac
+`~/Library/Application Support/SoftKVM/` (`identity.key`, `trusted-pcs.json`). Logs: next to
+`softkvm.exe` on the PC, `~/Library/Logs/SoftKVMHost.log` on the Mac.
 
 ## Caveats
 
-- Virtual displays use Apple's private `CGVirtualDisplay` API (same as DeskPad / BetterDisplay); a macOS update can break it.
-- The Mac app needs Screen Recording and (for input) Accessibility permission, granted once.
-- Wired Ethernet on both ends is strongly recommended.
-
-## Building
-
-**Mac host** (on the Mac): `mac-host/setup-signing.sh` once, then `mac-host/install.sh`, which builds,
-installs `/Applications/SoftKVM Host.app` and launches it. Grant Screen Recording and Accessibility on first launch.
-
-**PC client** (cross-compiled from Linux with mingw-w64): `pc-client/build.sh` → `pc-client/dist/`
-(`softkvm.exe` + DLLs). Run `softkvm.exe` (optionally `softkvm.exe <mac-ip>` to skip discovery).
-
-**Test without a PC**: `python3 tools/recv.py <mac-ip> --seconds 10` dumps the stream to
-`tools/out/stream0.h265`.
+- Virtual displays rely on Apple's private `CGVirtualDisplay` API (as DeskPad and BetterDisplay do); a
+  macOS update could break it.
+- After a reboot with FileVault, the Mac must be unlocked at its own keyboard once.
+- Closed-lid use hasn't been tested yet; a MacBook normally sleeps when its lid closes.
