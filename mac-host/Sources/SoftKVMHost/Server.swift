@@ -7,10 +7,31 @@ final class Server: @unchecked Sendable {
     private let queue = DispatchQueue(label: "softkvm.server")
     private var listener: NWListener?
     private var session: ClientSession?
-    let bitrate: Int
+    private var bitrate: Int
+    let hostName: String
 
-    init(bitrate: Int) {
+    init(bitrate: Int, hostName: String) {
         self.bitrate = bitrate
+        self.hostName = hostName
+    }
+
+    // MARK: - Menu actions (any thread)
+
+    func setBitrate(_ bitrate: Int) {
+        queue.async {
+            self.bitrate = bitrate
+            self.session?.setBitrate(bitrate)
+            Log.info("server: bitrate set to \(bitrate / 1_000_000) Mbps")
+        }
+    }
+
+    /// Asks the PC to use these monitors (bit i = monitor index i). The PC reconnects.
+    func requestMonitors(mask: UInt32) {
+        queue.async { self.session?.requestMonitors(mask: mask) }
+    }
+
+    func disconnect() {
+        queue.async { self.session?.sayGoodbye() }
     }
 
     func start() throws {
@@ -28,9 +49,12 @@ final class Server: @unchecked Sendable {
     private func accept(_ conn: NWConnection) {
         Log.info("server: connection from \(conn.endpoint)")
         session?.close(reason: "replaced by new client")
-        let s = ClientSession(connection: conn, bitrate: bitrate, queue: queue)
+        let s = ClientSession(connection: conn, bitrate: bitrate, hostName: hostName, queue: queue)
         s.onClose = { [weak self, weak s] in
-            if let self, self.session === s { self.session = nil }
+            if let self, self.session === s {
+                self.session = nil
+                AppState.update { $0.clientName = nil; $0.clientAddress = nil; $0.monitors = [] }
+            }
         }
         session = s
         s.start()
@@ -41,7 +65,8 @@ final class Server: @unchecked Sendable {
 final class ClientSession: @unchecked Sendable {
     private let conn: NWConnection
     private let queue: DispatchQueue
-    private let bitrate: Int
+    private var bitrate: Int
+    private let hostName: String
     private var pipelines: [DisplayPipeline] = []
     private let injector = InputInjector()
     private var closed = false
@@ -60,10 +85,35 @@ final class ClientSession: @unchecked Sendable {
     private static let softLimit = 3 * 1024 * 1024
     private static let hardLimit = 12 * 1024 * 1024
 
-    init(connection: NWConnection, bitrate: Int, queue: DispatchQueue) {
+    init(connection: NWConnection, bitrate: Int, hostName: String, queue: DispatchQueue) {
         self.conn = connection
         self.bitrate = bitrate
+        self.hostName = hostName
         self.queue = queue
+    }
+
+    func setBitrate(_ b: Int) {
+        bitrate = b
+        pipelines.forEach { $0.setBitrate(b) }
+    }
+
+    func requestMonitors(mask: UInt32) {
+        var d = Data()
+        d.appendLE(mask)
+        send(Proto.message(.setMonitors, payload: d))
+        Log.info("session: asked the PC to use monitor mask \(mask)")
+    }
+
+    private var peerAddress: String {
+        if case .hostPort(let host, _) = conn.endpoint {
+            switch host {
+            case .ipv4(let a): return "\(a)"
+            case .ipv6(let a): return "\(a)"
+            case .name(let n, _): return n
+            @unknown default: return "\(host)"
+            }
+        }
+        return "\(conn.endpoint)"
     }
 
     func start() {
@@ -91,6 +141,15 @@ final class ClientSession: @unchecked Sendable {
         }
         timer.resume()
         heartbeat = timer
+    }
+
+    /// Tells the client this is deliberate (so it stays disconnected), then closes.
+    func sayGoodbye() {
+        guard !closed else { return }
+        let data = Proto.message(.bye)
+        conn.send(content: data, completion: .contentProcessed { [weak self] _ in
+            self?.queue.async { self?.close(reason: "disconnected from the menu") }
+        })
     }
 
     func close(reason: String) {
@@ -159,6 +218,8 @@ final class ClientSession: @unchecked Sendable {
             }
         case .input:
             if !HostEnv.perf { injector.handle(payload) }
+        case .monitors:
+            handleMonitors(payload)
         default:
             Log.info("session: ignoring message type \(type)")
         }
@@ -192,7 +253,12 @@ final class ClientSession: @unchecked Sendable {
 
         var ack = Data()
         ack.appendLE(Proto.version)
+        let nameBytes = Array(hostName.utf8.prefix(255))
+        ack.append(UInt8(nameBytes.count))
+        ack.append(contentsOf: nameBytes)
         send(Proto.message(.helloAck, payload: ack))
+        let address = peerAddress
+        AppState.update { $0.clientName = $0.clientName ?? "PC"; $0.clientAddress = address }
 
         for (i, r) in requests.enumerated() {
             let pipeline = DisplayPipeline(
@@ -228,6 +294,30 @@ final class ClientSession: @unchecked Sendable {
             }
             self.queue.async { self.streamsReady = true; self.startCursor() }
         }
+    }
+
+    /// MONITORS: u8 nameLen, name, u8 n, then n × {u8 index, u8 selected, u32 w, u32 h, u32 hz, u8 len, name}
+    private func handleMonitors(_ p: Data) {
+        var o = 0
+        func u8() -> UInt8? { defer { o += 1 }; return p.readLE(UInt8.self, at: o) }
+        func u32() -> UInt32? { defer { o += 4 }; return p.readLE(UInt32.self, at: o) }
+        func str() -> String? {
+            guard let len = u8(), o + Int(len) <= p.count else { return nil }
+            let s = String(decoding: p[(p.startIndex + o)..<(p.startIndex + o + Int(len))], as: UTF8.self)
+            o += Int(len)
+            return s
+        }
+        guard let pcName = str(), let n = u8() else { return }
+        var list: [PCMonitor] = []
+        for _ in 0..<n {
+            guard let idx = u8(), let sel = u8(), let w = u32(), let h = u32(), let hz = u32(), let name = str()
+            else { return }
+            list.append(PCMonitor(index: Int(idx), name: name, width: Int(w), height: Int(h), refresh: Int(hz),
+                                  selected: sel != 0))
+        }
+        Log.info("session: PC \"\(pcName)\" has \(list.count) monitors: "
+                 + list.map { "\($0.name)\($0.selected ? "*" : "")" }.joined(separator: ", "))
+        AppState.update { $0.clientName = pcName; $0.monitors = list }
     }
 
     // MARK: - Cursor and layout

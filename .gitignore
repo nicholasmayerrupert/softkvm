@@ -6,7 +6,7 @@ mac-host/*.app
 
 # PC client
 pc-client/build*/
-pc-client/deps/
+pc-client/deps
 *.exe
 *.dll
 

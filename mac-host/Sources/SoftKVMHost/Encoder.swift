@@ -64,6 +64,11 @@ final class VideoEncoder {
         return d as CFDictionary
     }
 
+    func setBitrate(_ bitrate: Int) {
+        guard let session else { return }
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+    }
+
     /// `completion` runs once per call when VideoToolbox is done with the frame (encoded,
     /// dropped or failed), on a VideoToolbox thread, after `output`.
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKeyframe: Bool, timing: FrameTiming = FrameTiming(),

@@ -5,6 +5,11 @@ import Foundation
 enum Proto {
     static let version: UInt32 = 0
     static let port: UInt16 = 47900
+    /// UDP port for LAN discovery: clients broadcast `discoverRequest`, hosts answer
+    /// `discoverReply` + u16 TCP port + UTF-8 name.
+    static let discoveryPort: UInt16 = 47901
+    static let discoverRequest = Array("SOFTKVM_DISCOVER".utf8)
+    static let discoverReply = Array("SOFTKVM_HOST".utf8)
     static let headerSize = 8
     static let maxPayload = 64 * 1024 * 1024
     static let audioSampleRate = 48_000
@@ -19,9 +24,13 @@ enum Proto {
         case layout = 0x06
         case cursor = 0x07
         case cursorPos = 0x08
+        case setMonitors = 0x09
+        /// Deliberate disconnect: the client should not reconnect until its user asks.
+        case bye = 0x0A
         // client -> host
         case hello = 0x81
         case keyframeRequest = 0x82
+        case monitors = 0x83
         case input = 0x90
     }
 
