@@ -40,6 +40,9 @@ enum {
     MSG_VIDEO = 0x03,
     MSG_AUDIO = 0x04,
     MSG_PING = 0x05,
+    MSG_LAYOUT = 0x06,
+    MSG_CURSOR = 0x07,
+    MSG_CURSOR_POS = 0x08,
     MSG_HELLO = 0x81,
     MSG_KEYFRAME_REQUEST = 0x82,
     MSG_INPUT = 0x90,
@@ -69,6 +72,10 @@ typedef struct {
     SDL_Renderer *ren;
     SDL_Texture *tex;
     int tex_w, tex_h, tex_fmt;
+    SDL_Texture *cursor_tex;
+    int cursor_tex_version;
+    int dirty;  // needs a redraw (e.g. the local cursor moved)
+    Uint32 last_present;
 
     // stats
     int frames, decoded_bytes;
@@ -97,14 +104,34 @@ static SDL_AudioDeviceID g_audio;
 static int g_audio_playing;
 
 // Input / mode switching
-enum { IN_MOUSE_MOVE = 1, IN_MOUSE_BUTTON = 2, IN_SCROLL = 3, IN_KEY = 4, IN_RELEASE_ALL = 5 };
+enum { IN_MOUSE_MOVE = 1, IN_MOUSE_BUTTON = 2, IN_SCROLL = 3, IN_KEY = 4, IN_RELEASE_ALL = 5,
+       IN_MOUSE_MOVE_GLOBAL = 6 };
 #define HOTKEY_ID_TOGGLE 1
 static int g_mac_mode = 1;
 static int g_start_hidden;
 static int g_pc_style_modifiers = 1;
 static int g_hotkey_registered;
 static Uint32 g_last_toggle;
-static struct { int valid, stream, x, y; } g_pending_move;
+static int g_pending_move;
+
+// Mac display arrangement (global Mac points), written by the net thread.
+#define MAX_MAC_DISPLAYS 8
+typedef struct { int stream; double x, y, w, h; } MacDisplay;
+static SDL_mutex *g_shared_lock;  // guards the g_net_* fields below
+static MacDisplay g_net_layout[MAX_MAC_DISPLAYS];
+static int g_net_nlayout, g_net_layout_version;
+static uint8_t *g_net_cursor_px;
+static int g_net_cursor_w, g_net_cursor_h, g_net_cursor_hx, g_net_cursor_hy, g_net_cursor_version;
+static int g_net_cursor_pos_pending;
+static double g_net_cursor_x, g_net_cursor_y;
+
+// Main-thread copies.
+static MacDisplay g_layout[MAX_MAC_DISPLAYS];
+static int g_nlayout, g_layout_version;
+static double g_cx, g_cy;  // the Mac cursor, in global Mac points
+static int g_cursor_valid;
+static int g_cursor_w, g_cursor_h, g_cursor_hx, g_cursor_hy, g_cursor_version;
+static uint8_t *g_cursor_px;
 
 static void logf_(const char *fmt, ...) {
     char buf[1024];
@@ -324,8 +351,54 @@ static void play_audio(const uint8_t *payload, uint32_t len) {
     }
 }
 
+static void notify_main(void) {
+    SDL_Event ev = {0};
+    ev.type = g_frame_event;
+    SDL_PushEvent(&ev);
+}
+
+static void handle_layout(const uint8_t *p, uint32_t len) {
+    if (len < 4) return;
+    uint32_t n = get_u32(p);
+    if (n > MAX_MAC_DISPLAYS || len < 4 + n * 20) return;
+    SDL_LockMutex(g_shared_lock);
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *e = p + 4 + i * 20;
+        g_net_layout[i].stream = e[0] == 0xFF ? -1 : e[0];
+        g_net_layout[i].x = (int32_t)get_u32(e + 4);
+        g_net_layout[i].y = (int32_t)get_u32(e + 8);
+        g_net_layout[i].w = (int32_t)get_u32(e + 12);
+        g_net_layout[i].h = (int32_t)get_u32(e + 16);
+        LOG("layout: %s at %.0f,%.0f %.0fx%.0f", e[0] == 0xFF ? "mac display" : "stream",
+            g_net_layout[i].x, g_net_layout[i].y, g_net_layout[i].w, g_net_layout[i].h);
+    }
+    g_net_nlayout = (int)n;
+    g_net_layout_version++;
+    SDL_UnlockMutex(g_shared_lock);
+    notify_main();
+}
+
+static void handle_cursor_shape(const uint8_t *p, uint32_t len) {
+    if (len < 16) return;
+    int hx = (int32_t)get_u32(p), hy = (int32_t)get_u32(p + 4);
+    uint32_t w = get_u32(p + 8), h = get_u32(p + 12);
+    if (w == 0 || h == 0 || w > 256 || h > 256 || len < 16 + w * h * 4) return;
+    uint8_t *px = malloc(w * h * 4);
+    memcpy(px, p + 16, w * h * 4);
+    SDL_LockMutex(g_shared_lock);
+    free(g_net_cursor_px);
+    g_net_cursor_px = px;
+    g_net_cursor_w = (int)w;
+    g_net_cursor_h = (int)h;
+    g_net_cursor_hx = hx;
+    g_net_cursor_hy = hy;
+    g_net_cursor_version++;
+    SDL_UnlockMutex(g_shared_lock);
+    notify_main();
+}
+
 static int send_hello(void) {
-    uint8_t buf[8 + MAX_STREAMS * 12];
+    uint8_t buf[8 + MAX_STREAMS * 20];
     put_u32(buf, PROTO_VERSION);
     put_u32(buf + 4, (uint32_t)g_nstreams);
     for (int i = 0; i < g_nstreams; i++) {
@@ -333,7 +406,15 @@ static int send_hello(void) {
         put_u32(buf + 12 + i * 12, (uint32_t)g_streams[i].h);
         put_u32(buf + 16 + i * 12, (uint32_t)g_streams[i].fps);
     }
-    return send_msg(MSG_HELLO, 0, buf, 8 + g_nstreams * 12);
+    // Extension: each monitor's desktop origin so the Mac can arrange its displays alike.
+    uint8_t *ext = buf + 8 + g_nstreams * 12;
+    for (int i = 0; i < g_nstreams; i++) {
+        SDL_Rect b;
+        SDL_GetDisplayBounds(g_streams[i].monitor, &b);
+        put_u32(ext + i * 8, (uint32_t)b.x);
+        put_u32(ext + i * 8 + 4, (uint32_t)b.y);
+    }
+    return send_msg(MSG_HELLO, 0, buf, 8 + g_nstreams * 20);
 }
 
 static int net_thread(void *unused) {
@@ -387,6 +468,26 @@ static int net_thread(void *unused) {
             case MSG_AUDIO:
                 play_audio(buf, len);
                 break;
+            case MSG_LAYOUT:
+                handle_layout(buf, len);
+                break;
+            case MSG_CURSOR:
+                handle_cursor_shape(buf, len);
+                break;
+            case MSG_CURSOR_POS:
+                if (len >= 8) {
+                    float x, y;
+                    uint32_t ux = get_u32(buf), uy = get_u32(buf + 4);
+                    memcpy(&x, &ux, 4);
+                    memcpy(&y, &uy, 4);
+                    SDL_LockMutex(g_shared_lock);
+                    g_net_cursor_x = x;
+                    g_net_cursor_y = y;
+                    g_net_cursor_pos_pending = 1;
+                    SDL_UnlockMutex(g_shared_lock);
+                    notify_main();
+                }
+                break;
             default:
                 break;
             }
@@ -411,6 +512,55 @@ static int net_thread(void *unused) {
 
 // ---------------------------------------------------------------------------
 // Rendering (main thread)
+
+static const MacDisplay *layout_for_stream(int stream) {
+    for (int i = 0; i < g_nlayout; i++)
+        if (g_layout[i].stream == stream) return &g_layout[i];
+    return NULL;
+}
+
+static int display_at(double x, double y) {
+    for (int i = 0; i < g_nlayout; i++)
+        if (x >= g_layout[i].x && x < g_layout[i].x + g_layout[i].w && y >= g_layout[i].y &&
+            y < g_layout[i].y + g_layout[i].h)
+            return i;
+    return -1;
+}
+
+/// Stream index showing the cursor right now, or -1 (e.g. it's on the MacBook's own screen).
+static int cursor_stream(void) {
+    if (!g_cursor_valid) return -1;
+    int d = display_at(g_cx, g_cy);
+    return d >= 0 ? g_layout[d].stream : -1;
+}
+
+/// Draws the Mac cursor locally so it moves with zero video latency.
+static void draw_cursor(Stream *s) {
+    if (!g_mac_mode || !g_cursor_valid || !g_cursor_px) return;
+    int idx = (int)(s - g_streams);
+    const MacDisplay *d = layout_for_stream(idx);
+    if (!d || cursor_stream() != idx) return;
+    if (s->cursor_tex_version != g_cursor_version || !s->cursor_tex) {
+        if (s->cursor_tex) SDL_DestroyTexture(s->cursor_tex);
+        s->cursor_tex = SDL_CreateTexture(s->ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC,
+                                          g_cursor_w, g_cursor_h);
+        if (!s->cursor_tex) return;
+        SDL_UpdateTexture(s->cursor_tex, NULL, g_cursor_px, g_cursor_w * 4);
+        SDL_SetTextureBlendMode(s->cursor_tex, SDL_BLENDMODE_BLEND);
+        s->cursor_tex_version = g_cursor_version;
+    }
+    int ow, oh;
+    SDL_GetRendererOutputSize(s->ren, &ow, &oh);
+    double sx = ow / d->w, sy = oh / d->h;
+    SDL_Rect r = {(int)((g_cx - d->x - g_cursor_hx) * sx), (int)((g_cy - d->y - g_cursor_hy) * sy),
+                  (int)(g_cursor_w * sx + 0.5), (int)(g_cursor_h * sy + 0.5)};
+    SDL_RenderCopy(s->ren, s->cursor_tex, NULL, &r);
+}
+
+static void mark_cursor_dirty(void) {
+    int i = cursor_stream();
+    if (i >= 0) g_streams[i].dirty = 1;
+}
 
 static void render_stream(Stream *s) {
     AVFrame *f = av_frame_alloc();
@@ -446,7 +596,10 @@ static void render_stream(Stream *s) {
     SDL_SetRenderDrawColor(s->ren, 0, 0, 0, 255);
     SDL_RenderClear(s->ren);
     if (s->tex) SDL_RenderCopy(s->ren, s->tex, NULL, NULL);
+    draw_cursor(s);
     SDL_RenderPresent(s->ren);
+    s->dirty = 0;
+    s->last_present = SDL_GetTicks();
 }
 
 static int create_window(Stream *s, int idx) {
@@ -460,7 +613,7 @@ static int create_window(Stream *s, int idx) {
         return -1;
     }
     SDL_SetWindowFullscreen(s->win, SDL_WINDOW_FULLSCREEN_DESKTOP);
-    s->ren = SDL_CreateRenderer(s->win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    s->ren = SDL_CreateRenderer(s->win, -1, SDL_RENDERER_ACCELERATED);
     if (!s->ren) {
         LOG("renderer: %s", SDL_GetError());
         return -1;
@@ -480,20 +633,78 @@ static int create_window(Stream *s, int idx) {
 static void send_input(const uint8_t *p, uint32_t n) { send_msg(MSG_INPUT, 0, p, n); }
 
 static void flush_mouse_move(void) {
-    if (!g_pending_move.valid) return;
-    uint8_t p[10];
-    p[0] = IN_MOUSE_MOVE;
-    p[1] = (uint8_t)g_pending_move.stream;
-    put_u32(p + 2, (uint32_t)g_pending_move.x);
-    put_u32(p + 6, (uint32_t)g_pending_move.y);
+    if (!g_pending_move) return;
+    g_pending_move = 0;
+    float x = (float)g_cx, y = (float)g_cy;
+    uint32_t ux, uy;
+    memcpy(&ux, &x, 4);
+    memcpy(&uy, &y, 4);
+    uint8_t p[9];
+    p[0] = IN_MOUSE_MOVE_GLOBAL;
+    put_u32(p + 1, ux);
+    put_u32(p + 5, uy);
     send_input(p, sizeof p);
-    g_pending_move.valid = 0;
 }
 
 static void send_release_all(void) {
     uint8_t p[1] = {IN_RELEASE_ALL};
-    g_pending_move.valid = 0;
     send_input(p, 1);
+}
+
+static double clampd(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/// Moves the Mac cursor by a relative amount, sliding along the edges of the Mac's display
+/// arrangement like macOS does, so it can travel onto any Mac display (including the built-in one).
+static void move_cursor(double dx, double dy) {
+    if (!g_cursor_valid || g_nlayout == 0) return;
+    int cur = display_at(g_cx, g_cy);
+    if (cur < 0) {
+        cur = 0;
+        g_cx = clampd(g_cx, g_layout[0].x, g_layout[0].x + g_layout[0].w - 1);
+        g_cy = clampd(g_cy, g_layout[0].y, g_layout[0].y + g_layout[0].h - 1);
+    }
+    mark_cursor_dirty();
+    double nx = g_cx + dx;
+    if (display_at(nx, g_cy) < 0) nx = clampd(nx, g_layout[cur].x, g_layout[cur].x + g_layout[cur].w - 1);
+    int c2 = display_at(nx, g_cy);
+    if (c2 < 0) c2 = cur;
+    double ny = g_cy + dy;
+    if (display_at(nx, ny) < 0) ny = clampd(ny, g_layout[c2].y, g_layout[c2].y + g_layout[c2].h - 1);
+    g_cx = nx;
+    g_cy = ny;
+    mark_cursor_dirty();
+    g_pending_move = 1;
+}
+
+/// Pulls layout, cursor shape and host-reported cursor position from the net thread.
+static void sync_shared_state(void) {
+    SDL_LockMutex(g_shared_lock);
+    if (g_layout_version != g_net_layout_version) {
+        memcpy(g_layout, g_net_layout, sizeof g_layout);
+        g_nlayout = g_net_nlayout;
+        g_layout_version = g_net_layout_version;
+        for (int i = 0; i < g_nstreams; i++) g_streams[i].dirty = 1;
+    }
+    if (g_cursor_version != g_net_cursor_version && g_net_cursor_px) {
+        free(g_cursor_px);
+        g_cursor_px = malloc((size_t)g_net_cursor_w * g_net_cursor_h * 4);
+        memcpy(g_cursor_px, g_net_cursor_px, (size_t)g_net_cursor_w * g_net_cursor_h * 4);
+        g_cursor_w = g_net_cursor_w;
+        g_cursor_h = g_net_cursor_h;
+        g_cursor_hx = g_net_cursor_hx;
+        g_cursor_hy = g_net_cursor_hy;
+        g_cursor_version = g_net_cursor_version;
+        mark_cursor_dirty();
+    }
+    if (g_net_cursor_pos_pending) {
+        g_net_cursor_pos_pending = 0;
+        mark_cursor_dirty();
+        g_cx = g_net_cursor_x;
+        g_cy = g_net_cursor_y;
+        g_cursor_valid = 1;
+        mark_cursor_dirty();
+    }
+    SDL_UnlockMutex(g_shared_lock);
 }
 
 static int stream_for_window(Uint32 window_id) {
@@ -505,24 +716,46 @@ static int stream_for_window(Uint32 window_id) {
 static void set_mac_mode(int on) {
     g_mac_mode = on;
     if (on) {
-        // Bring up every Mac window, then focus the one on the monitor the cursor is on.
+        // Bring up every Mac window and focus the one on the monitor the PC cursor is on.
+        // The Mac cursor jumps to the same spot, so switching feels continuous.
         int gx, gy, focus = 0;
         SDL_GetGlobalMouseState(&gx, &gy);
         for (int i = 0; i < g_nstreams; i++) {
             SDL_ShowWindow(g_streams[i].win);
             SDL_Rect b;
             SDL_GetDisplayBounds(g_streams[i].monitor, &b);
-            if (gx >= b.x && gx < b.x + b.w && gy >= b.y && gy < b.y + b.h) focus = i;
-            render_stream(&g_streams[i]);
+            if (gx >= b.x && gx < b.x + b.w && gy >= b.y && gy < b.y + b.h) {
+                focus = i;
+                const MacDisplay *d = layout_for_stream(i);
+                if (d) {
+                    g_cx = d->x + (double)(gx - b.x) / b.w * d->w;
+                    g_cy = d->y + (double)(gy - b.y) / b.h * d->h;
+                    g_cursor_valid = 1;
+                    g_pending_move = 1;
+                }
+            }
+            g_streams[i].dirty = 1;
         }
         SDL_RaiseWindow(g_streams[focus].win);
         SDL_SetWindowKeyboardGrab(g_streams[focus].win, SDL_TRUE);
-        SDL_ShowCursor(SDL_DISABLE);
+        // Relative mode: Windows' cursor is hidden and pinned; we get raw movement (with the
+        // system pointer speed applied) and move the Mac cursor ourselves.
+        if (SDL_SetRelativeMouseMode(SDL_TRUE) != 0) LOG("relative mouse: %s (will retry on focus)", SDL_GetError());
+        for (int i = 0; i < g_nstreams; i++) render_stream(&g_streams[i]);
     } else {
         send_release_all();
+        SDL_SetRelativeMouseMode(SDL_FALSE);
+        // Put the PC cursor where the Mac cursor was, if it was on one of the monitors.
+        int cs = cursor_stream();
+        const MacDisplay *d = cs >= 0 ? layout_for_stream(cs) : NULL;
         for (int i = 0; i < g_nstreams; i++) {
             SDL_SetWindowKeyboardGrab(g_streams[i].win, SDL_FALSE);
             SDL_HideWindow(g_streams[i].win);
+        }
+        if (d) {
+            SDL_Rect b;
+            SDL_GetDisplayBounds(g_streams[cs].monitor, &b);
+            SDL_WarpMouseGlobal(b.x + (int)((g_cx - d->x) / d->w * b.w), b.y + (int)((g_cy - d->y) / d->h * b.h));
         }
         SDL_ShowCursor(SDL_ENABLE);
     }
@@ -550,18 +783,9 @@ static int mouse_button_index(Uint8 b) {
 /// Handles keyboard/mouse events while in Mac mode. Returns 1 if the event was consumed.
 static int forward_input(const SDL_Event *ev) {
     switch (ev->type) {
-    case SDL_MOUSEMOTION: {
-        int i = stream_for_window(ev->motion.windowID);
-        if (i < 0) return 0;
-        int ww, wh;
-        SDL_GetWindowSize(g_streams[i].win, &ww, &wh);
-        if (ww <= 0 || wh <= 0) return 1;
-        g_pending_move.valid = 1;
-        g_pending_move.stream = i;
-        g_pending_move.x = (int)((int64_t)ev->motion.x * g_streams[i].w / ww);
-        g_pending_move.y = (int)((int64_t)ev->motion.y * g_streams[i].h / wh);
+    case SDL_MOUSEMOTION:
+        move_cursor(ev->motion.xrel, ev->motion.yrel);
         return 1;
-    }
     case SDL_MOUSEBUTTONDOWN:
     case SDL_MOUSEBUTTONUP: {
         int b = mouse_button_index(ev->button.button);
@@ -641,6 +865,8 @@ int main(int argc, char **argv) {
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
     SDL_SetHint(SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED, "0");
+    SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, "0");
+    SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "1");  // honor Windows pointer speed/acceleration
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
@@ -688,6 +914,7 @@ int main(int argc, char **argv) {
 
     g_frame_event = SDL_RegisterEvents(1);
     g_send_lock = SDL_CreateMutex();
+    g_shared_lock = SDL_CreateMutex();
     for (int i = 0; i < g_nstreams; i++) {
         Stream *s = &g_streams[i];
         s->lock = SDL_CreateMutex();
@@ -719,9 +946,11 @@ int main(int argc, char **argv) {
 
     while (!SDL_AtomicGet(&g_quit)) {
         SDL_Event ev;
-        if (!SDL_WaitEventTimeout(&ev, 100)) continue;
+        int any_dirty = 0;
+        for (int i = 0; i < g_nstreams; i++) any_dirty |= g_streams[i].dirty;
+        int got = SDL_WaitEventTimeout(&ev, g_mac_mode && any_dirty ? 2 : 100);
         int check_focus = 0;
-        do {
+        if (got) do {
             if (ev.type == SDL_QUIT) {
                 SDL_AtomicSet(&g_quit, 1);
             } else if (ev.type == SDL_SYSWMEVENT) {
@@ -730,8 +959,10 @@ int main(int argc, char **argv) {
             } else if (ev.type == SDL_KEYDOWN && (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_ALT) &&
                        (ev.key.keysym.sym == SDLK_q || ev.key.keysym.sym == SDLK_SPACE)) {
                 // Local hotkeys are never forwarded.
+                // In Mac mode the keyboard grab swallows Ctrl+Alt+Space before Windows' hotkey
+                // sees it, so handle it here too (toggle_mode debounces duplicates).
                 if (ev.key.keysym.sym == SDLK_q) SDL_AtomicSet(&g_quit, 1);
-                else if (!g_hotkey_registered) toggle_mode();
+                else toggle_mode();
             } else if (ev.type == SDL_WINDOWEVENT) {
                 if (ev.window.event == SDL_WINDOWEVENT_EXPOSED && g_mac_mode) {
                     int i = stream_for_window(ev.window.windowID);
@@ -739,6 +970,7 @@ int main(int argc, char **argv) {
                 } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_GAINED && g_mac_mode) {
                     SDL_Window *w = SDL_GetWindowFromID(ev.window.windowID);
                     if (w) SDL_SetWindowKeyboardGrab(w, SDL_TRUE);
+                    if (!SDL_GetRelativeMouseMode()) SDL_SetRelativeMouseMode(SDL_TRUE);
                 } else if (ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
                     check_focus = 1;
                 }
@@ -746,6 +978,7 @@ int main(int argc, char **argv) {
                 forward_input(&ev);
             }
         } while (SDL_PollEvent(&ev));
+        sync_shared_state();
         flush_mouse_move();
 
         // Focus left our windows entirely (e.g. Ctrl+Alt+Del): lift keys held on the Mac.
@@ -756,11 +989,14 @@ int main(int argc, char **argv) {
         }
 
         if (!g_mac_mode) continue;  // keep decoding in the background, draw when shown
+        Uint32 now = SDL_GetTicks();
         for (int i = 0; i < g_nstreams; i++) {
-            SDL_LockMutex(g_streams[i].lock);
-            int fresh = g_streams[i].has_new;
-            SDL_UnlockMutex(g_streams[i].lock);
-            if (fresh) render_stream(&g_streams[i]);
+            Stream *st = &g_streams[i];
+            SDL_LockMutex(st->lock);
+            int fresh = st->has_new;
+            SDL_UnlockMutex(st->lock);
+            // New video draws immediately; cursor-only redraws are capped at ~250 Hz.
+            if (fresh || (st->dirty && now - st->last_present >= 4)) render_stream(st);
         }
     }
 

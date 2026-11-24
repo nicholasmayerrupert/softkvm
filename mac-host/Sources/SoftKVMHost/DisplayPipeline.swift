@@ -92,7 +92,7 @@ final class DisplayPipeline: NSObject, SCStreamOutput, SCStreamDelegate, @unchec
         config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.colorMatrix = CGDisplayStream.yCbCrMatrix_ITU_R_709_2
         config.colorSpaceName = CGColorSpace.sRGB
-        config.showsCursor = true
+        config.showsCursor = false  // the client draws the cursor locally (no video latency)
         config.queueDepth = 5
         if audioSink != nil {
             config.capturesAudio = true

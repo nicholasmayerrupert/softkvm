@@ -16,6 +16,9 @@ enum Proto {
         case video = 0x03
         case audio = 0x04
         case ping = 0x05
+        case layout = 0x06
+        case cursor = 0x07
+        case cursorPos = 0x08
         // client -> host
         case hello = 0x81
         case keyframeRequest = 0x82

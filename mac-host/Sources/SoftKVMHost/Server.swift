@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Network
 
@@ -45,6 +46,10 @@ final class ClientSession: @unchecked Sendable {
     private let injector = InputInjector()
     private var closed = false
     private var heartbeat: DispatchSourceTimer?
+    private let cursor = CursorMonitor()
+    private var lastLayout: [DisplayLayout.Entry] = []
+    private var lastSentCursorPos = CGPoint(x: -100_000, y: -100_000)
+    private var streamsReady = false
     var onClose: (() -> Void)?
 
     // Backpressure: bytes handed to the socket but not yet sent.
@@ -80,7 +85,10 @@ final class ClientSession: @unchecked Sendable {
         // Heartbeat so the client can detect a dead link even when the screen is idle.
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 1, repeating: 1)
-        timer.setEventHandler { [weak self] in self?.send(Proto.message(.ping)) }
+        timer.setEventHandler { [weak self] in
+            self?.send(Proto.message(.ping))
+            self?.sendLayoutIfChanged()
+        }
         timer.resume()
         heartbeat = timer
     }
@@ -90,6 +98,7 @@ final class ClientSession: @unchecked Sendable {
         closed = true
         Log.info("session: closed (\(reason))")
         injector.releaseAll()
+        cursor.stop()
         heartbeat?.cancel()
         heartbeat = nil
         conn.cancel()
@@ -160,6 +169,17 @@ final class ClientSession: @unchecked Sendable {
         }
         Log.info("session: hello v\(version), displays: \(requests.map { "\($0.width)x\($0.height)@\($0.fps)" })")
 
+        // Optional extension: each PC monitor's desktop origin, so we can arrange alike.
+        var clientOrigins: [CGPoint] = []
+        let extBase = 8 + Int(n) * 12
+        if p.count >= extBase + Int(n) * 8 {
+            for i in 0..<Int(n) {
+                let x = p.readLE(Int32.self, at: extBase + i * 8) ?? 0
+                let y = p.readLE(Int32.self, at: extBase + i * 8 + 4) ?? 0
+                clientOrigins.append(CGPoint(x: Int(x), y: Int(y)))
+            }
+        }
+
         var ack = Data()
         ack.appendLE(Proto.version)
         send(Proto.message(.helloAck, payload: ack))
@@ -190,7 +210,48 @@ final class ClientSession: @unchecked Sendable {
                     return
                 }
             }
+            DisplayLayout.mirrorClientArrangement(displays: ps.map(\.displayID), clientOrigins: clientOrigins)
+            self.queue.async { self.streamsReady = true; self.startCursor() }
         }
+    }
+
+    // MARK: - Cursor and layout
+
+    private func startCursor() {
+        guard !closed else { return }
+        sendLayoutIfChanged()
+        cursor.onShape = { [weak self] payload in
+            self?.queue.async { self?.send(Proto.message(.cursor, payload: payload)) }
+        }
+        cursor.onPosition = { [weak self] pos in
+            self?.queue.async { self?.cursorMoved(to: pos) }
+        }
+        cursor.resendShape()
+        cursor.start()
+    }
+
+    /// Tells the client where the cursor is when something other than the client moved it
+    /// (the MacBook trackpad, an app warping it), so the local cursor stays in sync.
+    private func cursorMoved(to pos: CGPoint) {
+        guard !closed else { return }
+        let sinceOurMove = ProcessInfo.processInfo.systemUptime - injector.lastMoveTime
+        guard sinceOurMove > 0.3 else { lastSentCursorPos = pos; return }
+        guard abs(pos.x - lastSentCursorPos.x) > 0.5 || abs(pos.y - lastSentCursorPos.y) > 0.5 else { return }
+        lastSentCursorPos = pos
+        injector.syncPosition(pos)
+        var d = Data()
+        d.appendLE(Float(pos.x).bitPattern)
+        d.appendLE(Float(pos.y).bitPattern)
+        send(Proto.message(.cursorPos, payload: d))
+    }
+
+    private func sendLayoutIfChanged() {
+        guard streamsReady, !closed else { return }
+        let layout = DisplayLayout.current(streamDisplays: pipelines.map(\.displayID))
+        guard layout != lastLayout, !layout.isEmpty else { return }
+        lastLayout = layout
+        Log.info("layout: " + layout.map { "\($0.stream == 0xFF ? "mac" : "s\($0.stream)")@\(Int($0.rect.minX)),\(Int($0.rect.minY)) \(Int($0.rect.width))x\(Int($0.rect.height))" }.joined(separator: "  "))
+        send(Proto.message(.layout, payload: DisplayLayout.payload(layout)))
     }
 
     // MARK: - Sending

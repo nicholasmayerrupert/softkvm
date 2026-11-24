@@ -45,15 +45,18 @@ Host → client
 | `0x02` | STREAM_INFO | `u32 width, u32 height, u32 fps, u32 codec` (1 = HEVC, 2 = H.264) |
 | `0x03` | VIDEO | `u64 pts_us, u8 flags` (bit 0 = keyframe), then Annex B bitstream |
 | `0x05` | PING | (empty) sent every second; clients reconnect after ~4 s of silence |
+| `0x06` | LAYOUT | `u32 n`, then n × `u8 stream (0xFF = not streamed), u8[3], i32 x, y, w, h` — every Mac display in global points |
+| `0x07` | CURSOR | `i32 hot_x, hot_y, u32 w, h`, then w×h RGBA (straight alpha) — sent when the cursor shape changes |
+| `0x08` | CURSOR_POS | `f32 x, y` global points — when something other than the client moved the cursor |
 | `0x04` | AUDIO | `u64 pts_us`, then s16le stereo PCM @ 48 kHz (system audio) |
 
 Client → host
 
 | type | name | payload |
 |---|---|---|
-| `0x81` | HELLO | `u32 version, u32 n`, then n × `u32 width, u32 height, u32 fps` |
+| `0x81` | HELLO | `u32 version, u32 n`, then n × `u32 width, u32 height, u32 fps`, then optionally n × `i32 x, y` (each PC monitor's desktop origin, used to arrange the Mac's displays alike) |
 | `0x82` | KEYFRAME_REQUEST | (empty; `stream` field selects the display) |
-| `0x90` | INPUT | milestone 2 |
+| `0x90` | INPUT | first byte = kind; see `mac-host/Sources/SoftKVMHost/InputInjector.swift` |
 
 ## Caveats
 

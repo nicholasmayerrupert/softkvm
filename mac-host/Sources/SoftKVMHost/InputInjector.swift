@@ -12,10 +12,18 @@ import Foundation
 ///   3 SCROLL       f32 dx, f32 dy                 (wheel notches; dy > 0 = scroll up)
 ///   4 KEY          u16 macKeyCode, u8 down, u8 repeat
 ///   5 RELEASE_ALL
+///   6 MOUSE_MOVE_GLOBAL f32 x, f32 y            (global Mac display points)
 final class InputInjector {
     enum Kind: UInt8 {
-        case mouseMove = 1, mouseButton = 2, scroll = 3, key = 4, releaseAll = 5
+        case mouseMove = 1, mouseButton = 2, scroll = 3, key = 4, releaseAll = 5, mouseMoveGlobal = 6
     }
+
+    /// When we last moved the cursor, so the session can tell our moves from the user's
+    /// (e.g. someone touching the MacBook trackpad).
+    private(set) var lastMoveTime: TimeInterval = 0
+
+    /// Adopts a cursor position that changed outside our control.
+    func syncPosition(_ p: CGPoint) { position = p }
 
     /// Maps a stream index to (displayID, stream pixel size).
     var displayForStream: (Int) -> (CGDirectDisplayID, CGSize)? = { _ in nil }
@@ -56,6 +64,9 @@ final class InputInjector {
             key(code, down: down != 0, isRepeat: isRepeat)
         case .releaseAll:
             releaseAll()
+        case .mouseMoveGlobal:
+            guard let x = p.readLE(UInt32.self, at: 1), let y = p.readLE(UInt32.self, at: 5) else { return }
+            moveTo(CGPoint(x: Double(Float(bitPattern: x)), y: Double(Float(bitPattern: y))))
         }
     }
 
@@ -77,6 +88,11 @@ final class InputInjector {
         let sx = bounds.width / size.width, sy = bounds.height / size.height
         let pt = CGPoint(x: bounds.minX + min(max(x, 0), size.width - 1) * sx,
                          y: bounds.minY + min(max(y, 0), size.height - 1) * sy)
+        moveTo(pt)
+    }
+
+    private func moveTo(_ pt: CGPoint) {
+        lastMoveTime = ProcessInfo.processInfo.systemUptime
         let dx = pt.x - position.x, dy = pt.y - position.y
         position = pt
 
