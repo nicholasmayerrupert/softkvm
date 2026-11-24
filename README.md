@@ -64,7 +64,7 @@ Client → host
 
 ## Using it
 
-**Mac:** run `SoftKVMHost.app`. Its menu-bar icon shows whether a PC is connected and has:
+**Mac:** run **SoftKVM Host** from Applications. Its menu-bar icon shows whether a PC is connected and has:
 - **Use these PC monitors for the Mac:** one checkbox per PC monitor. Each checked monitor gets one Mac virtual display.
 - **Video quality**, **Disconnect PC**, **Permissions**, **Launch at Login**, **Open Log**, **Quit**.
 
@@ -85,8 +85,8 @@ Settings are saved in `%APPDATA%\SoftKVM\config.ini`; the log is next to `softkv
 
 ## Building
 
-**Mac host** (on the Mac): `mac-host/setup-signing.sh` once, then `mac-host/build.sh` →
-`mac-host/SoftKVMHost.app`. Grant Screen Recording on first launch.
+**Mac host** (on the Mac): `mac-host/setup-signing.sh` once, then `mac-host/install.sh`, which builds,
+installs `/Applications/SoftKVM Host.app` and launches it. Grant Screen Recording and Accessibility on first launch.
 
 **PC client** (cross-compiled from Linux with mingw-w64): `pc-client/build.sh` → `pc-client/dist/`
 (`softkvm.exe` + DLLs). Run `softkvm.exe` (optionally `softkvm.exe <mac-ip>` to skip discovery).
