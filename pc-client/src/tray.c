@@ -124,7 +124,7 @@ static void show_menu(void) {
     for (int i = 0; i < st.ndevices; i++) {
         AppDevice *d = &st.devices[i];
         const char *state = device_state_text(d, i == st.active, st.mac_mode, sbuf, sizeof sbuf);
-        if (i < 9) snprintf(buf, sizeof buf, "%s — %s\tCtrl+Alt+%d", d->name, state, i + 1);
+        if (i < 9 && st.ndevices >= 2) snprintf(buf, sizeof buf, "%s — %s\tCtrl+Alt+%d", d->name, state, i + 1);
         else snprintf(buf, sizeof buf, "%s — %s", d->name, state);
         add_item(m, MENU_ID(CMD_SELECT_DEVICE, i), buf, i == st.active, d->state != DEV_OFFLINE || i == st.active);
     }
@@ -301,12 +301,23 @@ int tray_init(void) {
     add_icon();
 
     g_hotkey_ok = RegisterHotKey(g_hwnd, HOTKEY_ID, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_SPACE) != 0;
-    for (int i = 0; i < 9; i++)  // Ctrl+Alt+1..9: jump to device N
-        RegisterHotKey(g_hwnd, HOTKEY_DEVICE_BASE + i, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, '1' + i);
+    // Ctrl+Alt+1..9 are registered by tray_set_device_hotkeys, only for devices that exist.
     return 0;
 }
 
 int tray_hotkey_registered(void) { return g_hotkey_ok; }
+
+static int g_device_hotkeys;
+
+void tray_set_device_hotkeys(int n) {
+    if (!g_hwnd) return;
+    if (n > 9) n = 9;
+    if (n == g_device_hotkeys) return;
+    for (int i = 0; i < 9; i++) UnregisterHotKey(g_hwnd, HOTKEY_DEVICE_BASE + i);
+    for (int i = 0; i < n; i++)
+        RegisterHotKey(g_hwnd, HOTKEY_DEVICE_BASE + i, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, '1' + i);
+    g_device_hotkeys = n;
+}
 
 void tray_set_status(int connected, const char *tooltip) {
     if (!g_hwnd) return;

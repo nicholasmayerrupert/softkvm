@@ -121,6 +121,7 @@ static SDL_atomic_t g_session_gen;
 static SDL_atomic_t g_paused;  // disconnected on purpose: don't reconnect until the user asks
 static SDL_atomic_t g_local_consent;  // pairing a new device: 0 asked, 1 user said yes, -1 no
 static int g_code_asking;              // the pairing window is waiting for that answer (main thread)
+static Uint32 g_resume_mac_until;      // a drop while on the device: go back to it if we reconnect by then
 static int g_want_mac_on_connect;
 static Uint32 g_cmd_event, g_net_event;
 
@@ -280,18 +281,28 @@ static int send_msg(uint8_t type, uint8_t stream, const uint8_t *payload, uint32
     return r;
 }
 
+static int net_should_stop(void);
+
+/// connect() with a timeout, checking every 100 ms whether the session is stopping (switching
+/// devices or quitting must not wait for an offline device).
 static int connect_timeout(SOCKET s, const struct sockaddr *addr, int len, int timeout_ms) {
     u_long nb = 1;
     ioctlsocket(s, FIONBIO, &nb);
     int r = connect(s, addr, len);
     if (r != 0 && WSAGetLastError() == WSAEWOULDBLOCK) {
-        fd_set wr, ex;
-        FD_ZERO(&wr);
-        FD_ZERO(&ex);
-        FD_SET(s, &wr);
-        FD_SET(s, &ex);
-        struct timeval tv = {timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-        r = select(0, NULL, &wr, &ex, &tv) == 1 && FD_ISSET(s, &wr) ? 0 : -1;
+        r = -1;
+        for (int waited = 0; waited < timeout_ms && !net_should_stop(); waited += 100) {
+            fd_set wr, ex;
+            FD_ZERO(&wr);
+            FD_ZERO(&ex);
+            FD_SET(s, &wr);
+            FD_SET(s, &ex);
+            struct timeval tv = {0, 100 * 1000};
+            int n = select(0, NULL, &wr, &ex, &tv);
+            if (n == 0) continue;
+            r = n == 1 && FD_ISSET(s, &wr) ? 0 : -1;
+            break;
+        }
     }
     nb = 0;
     ioctlsocket(s, FIONBIO, &nb);
@@ -1280,6 +1291,16 @@ static int forward_input(const SDL_Event *ev) {
     }
 }
 
+/// Ctrl + left Alt + Q / Space / 1..9 by physical key. Right Alt is excluded: on many layouts it's
+/// AltGr (= Ctrl+Alt to Windows), so AltGr+Q (@) or AltGr+7 ({) must keep typing characters.
+static int is_local_hotkey(const SDL_Keysym *k) {
+    if (!(k->mod & KMOD_CTRL) || !(k->mod & KMOD_LALT) || (k->mod & KMOD_RALT)) return 0;
+    if (k->scancode == SDL_SCANCODE_Q || k->scancode == SDL_SCANCODE_SPACE) return 1;
+    if (k->scancode >= SDL_SCANCODE_1 && k->scancode <= SDL_SCANCODE_9)
+        return g_cfg.ndevices >= 2 && (int)(k->scancode - SDL_SCANCODE_1) < g_cfg.ndevices;
+    return 0;
+}
+
 static void usage(void) {
     fprintf(stderr,
             "usage: softkvm [DEVICE_ADDRESS] [--port P] [--monitor N[:WxH@FPS]]... [--sw-decode]\n"
@@ -1470,6 +1491,7 @@ static void restart_session(void) {
 
 static void switch_to_device(int n) {
     if (n < 0 || n >= g_cfg.ndevices) return;
+    g_resume_mac_until = 0;
     if (g_mac_mode) set_mac_mode(0);
     stop_session(GOODBYE_SWITCHING);
     g_cfg.active = n;
@@ -1660,6 +1682,7 @@ static void update_tray(void) {
         snprintf(tip, sizeof tip, "SoftKVM — %s (%s)", st.devices[st.active].name, st.mac_mode ? "in control" : "ready");
     else snprintf(tip, sizeof tip, "SoftKVM — %s: not connected", st.devices[st.active].name);
     tray_set_status(connected, tip);
+    tray_set_device_hotkeys(g_cfg.ndevices >= 2 ? g_cfg.ndevices : 0);
 }
 
 static void offer_takeover(void) {
@@ -1701,6 +1724,7 @@ static void use_active_device(void) {
 static void handle_command(int cmd, int arg) {
     switch (cmd) {
     case CMD_TOGGLE_MODE:
+        g_resume_mac_until = 0;  // the user decides now
         if (g_mac_mode) set_mac_mode(0);
         else use_active_device();
         break;
@@ -1865,16 +1889,21 @@ static void handle_net_event(NetEvent *e) {
         g_session_dev.has_key = 1;
         SDL_UnlockMutex(g_shared_lock);
         save_config();
-        if (g_want_mac_on_connect) {
+        if (g_want_mac_on_connect || (g_resume_mac_until && SDL_GetTicks() < g_resume_mac_until)) {
+            if (!g_want_mac_on_connect) LOG("mode: reconnected quickly; back to %s", d->name);
             g_want_mac_on_connect = 0;
             set_mac_mode(1);
         }
+        g_resume_mac_until = 0;
         break;
     case NE_DISCONNECTED:
         if (!SDL_AtomicGet(&g_paused) && g_devrt[i].state != DEV_BUSY) set_dev_state(i, DEV_CONNECTING, "");
         if (g_mac_mode && !g_perf_bench_secs) {
             LOG("mode: lost %s; back to the PC", d->name);
             set_mac_mode(0);
+            // A blip (Wi-Fi, host restart): if it's back within 15 s, return to it by itself.
+            // Not after a deliberate goodbye (paused).
+            if (!SDL_AtomicGet(&g_paused)) g_resume_mac_until = SDL_GetTicks() + 15000;
         }
         break;
     case NE_BYE:
@@ -2063,14 +2092,13 @@ int main(int argc, char **argv) {
             } else if (ev.type == g_net_event) {
                 handle_net_event(ev.user.data1);
                 free(ev.user.data1);
-            } else if (ev.type == SDL_KEYDOWN && (ev.key.keysym.mod & KMOD_CTRL) && (ev.key.keysym.mod & KMOD_ALT) &&
-                       (ev.key.keysym.sym == SDLK_q || ev.key.keysym.sym == SDLK_SPACE ||
-                        (ev.key.keysym.sym >= SDLK_1 && ev.key.keysym.sym <= SDLK_9))) {
+            } else if (ev.type == SDL_KEYDOWN && is_local_hotkey(&ev.key.keysym)) {
                 // Local hotkeys are never forwarded. In Mac mode the keyboard grab swallows them
                 // before Windows' hotkeys see them (toggle_mode debounces duplicates).
-                if (ev.key.keysym.sym == SDLK_q) SDL_AtomicSet(&g_quit, 1);
-                else if (ev.key.keysym.sym == SDLK_SPACE) handle_command(CMD_TOGGLE_MODE, 0);
-                else handle_command(CMD_SELECT_DEVICE, ev.key.keysym.sym - SDLK_1);
+                SDL_Scancode sc = ev.key.keysym.scancode;
+                if (sc == SDL_SCANCODE_Q) SDL_AtomicSet(&g_quit, 1);
+                else if (sc == SDL_SCANCODE_SPACE) handle_command(CMD_TOGGLE_MODE, 0);
+                else handle_command(CMD_SELECT_DEVICE, sc - SDL_SCANCODE_1);
             } else if (ev.type == SDL_WINDOWEVENT) {
                 if (ev.window.event == SDL_WINDOWEVENT_EXPOSED && g_mac_mode) {
                     int i = stream_for_window(ev.window.windowID);

@@ -42,8 +42,19 @@ final class Server: @unchecked Sendable {
         self.listener = listener
     }
 
+    private static let maxWaiting = 8, maxWaitingPerAddress = 2
+    private var promptOpen = false  // one pairing prompt at a time
+
     private func accept(_ conn: NWConnection) {
         Log.info("server: connection from \(conn.endpoint)")
+        // Unauthenticated peers can't pile up connections (memory, prompts).
+        let address = ClientSession.address(of: conn.endpoint)
+        let fromThere = waiting.filter { $0.peerAddress == address }.count
+        if waiting.count >= Self.maxWaiting || fromThere >= Self.maxWaitingPerAddress {
+            Log.info("server: refusing \(address): too many pending connections")
+            conn.cancel()
+            return
+        }
         let s = ClientSession(connection: conn, server: self)
         waiting.append(s)
         s.start()
@@ -102,13 +113,28 @@ final class Server: @unchecked Sendable {
             admit(s, code: .ok)
             return
         }
+        if promptOpen {
+            Log.info("server: \(s.clientName) wants to pair, but another pairing is in progress")
+            s.sendAuth(.pairingDenied, "another pairing is in progress")
+            s.closeSoon("another pairing is in progress")
+            return
+        }
         Log.info("server: \(s.clientName) wants to pair (code \(s.pairingCode))")
+        promptOpen = true
         s.sendAuth(.pairingPending, "")
+        // Nobody answered in time: give up (this also closes the prompt).
+        queue.asyncAfter(deadline: .now() + 120) {
+            if s.state == .waitingForApproval {
+                s.sendAuth(.pairingDenied, "not approved in time")
+                s.closeSoon("approval timed out")
+            }
+        }
         let name = s.clientName, code = s.pairingCode
         DispatchQueue.main.async { [weak self] in
             guard let ask = self?.askPairing else { return }
             ask(name, code) { allowed in
                 self?.queue.async {
+                    self?.promptOpen = false
                     guard let self, !s.isClosed else { return }
                     if allowed {
                         TrustStore.shared.add(name: s.clientName, key: s.clientKey)
@@ -275,8 +301,10 @@ final class ClientSession: @unchecked Sendable {
         self.queue = server.queue
     }
 
-    var peerAddress: String {
-        if case .hostPort(let host, _) = conn.endpoint {
+    var peerAddress: String { Self.address(of: conn.endpoint) }
+
+    static func address(of endpoint: NWEndpoint) -> String {
+        if case .hostPort(let host, _) = endpoint {
             switch host {
             case .ipv4(let a): return "\(a)"
             case .ipv6(let a): return "\(a)"
@@ -284,7 +312,7 @@ final class ClientSession: @unchecked Sendable {
             @unknown default: return "\(host)"
             }
         }
-        return "\(conn.endpoint)"
+        return "\(endpoint)"
     }
 
     func start() {
@@ -408,7 +436,9 @@ final class ClientSession: @unchecked Sendable {
         receiveExactly(4) { [weak self] header in
             guard let self else { return }
             let len = Int(header.readLE(UInt32.self, at: 0) ?? 0)
-            guard len >= 16 + Proto.headerSize, len <= Proto.maxPayload + Proto.headerSize + 16 else {
+            // Everything a PC sends is small (input, monitor lists); don't buffer megabytes from a
+            // peer before its record has even been authenticated.
+            guard len >= 16 + Proto.headerSize, len <= 64 * 1024 + Proto.headerSize + 16 else {
                 return self.close(reason: "bad record length", keepDisplays: true)
             }
             self.receiveExactly(len) { body in
@@ -663,7 +693,9 @@ final class ClientSession: @unchecked Sendable {
         }
         Log.info("session: PC \"\(pcName)\" has \(list.count) monitors: "
                  + list.map { "\($0.name)\($0.selected ? "*" : "")" }.joined(separator: ", "))
-        AppState.update { $0.clientName = pcName; $0.monitors = list }
+        let shownName = Handshake.displayName(pcName)
+        let shownList = list.map { m -> PCMonitor in var m = m; m.name = Handshake.displayName(m.name); return m }
+        AppState.update { $0.clientName = shownName; $0.monitors = shownList }
     }
 
     // MARK: - Cursor and layout
