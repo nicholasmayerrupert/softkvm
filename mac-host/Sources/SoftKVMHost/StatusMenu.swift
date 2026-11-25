@@ -94,6 +94,16 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         quality.submenu = qualityMenu
         menu.addItem(quality)
 
+        let awdl = action("Pause AWDL while streaming", #selector(toggleAWDLPause))
+        awdl.state = AWDLPause.enabled ? .on : .off
+        awdl.toolTip = "Pauses AirDrop and other nearby Apple features while the PC is in Mac mode."
+        menu.addItem(awdl)
+        if AWDLPause.enabled && AWDLPause.service.status != .enabled {
+            let pending = AWDLPause.service.status == .requiresApproval
+            menu.addItem(action(pending ? "Approve AWDL helper in System Settings…" : "Set up AWDL helper…",
+                                #selector(setUpAWDLPause)))
+        }
+
         if state.clientName != nil {
             menu.addItem(action("Disconnect PC", #selector(disconnect)))
         }
@@ -162,6 +172,34 @@ final class StatusMenu: NSObject, NSMenuDelegate {
     }
 
     @objc private func disconnect() { server.disconnect() }
+
+    @objc private func toggleAWDLPause() {
+        AWDLPause.enabled.toggle()
+        server.refreshAWDLPause()
+        if AWDLPause.enabled && AWDLPause.service.status != .enabled { setUpAWDLPause() }
+    }
+
+    @objc private func setUpAWDLPause() {
+        let service = AWDLPause.service
+        do {
+            // macOS can report notFound before it has a background-items record for a new daemon.
+            if service.status != .enabled && service.status != .requiresApproval {
+                try service.register()
+            }
+        } catch {
+            // A registration that awaits approval can also report an error.
+            if service.status != .requiresApproval {
+                Log.info("AWDL helper setup: \(error.localizedDescription)")
+                let alert = NSAlert()
+                alert.messageText = "Couldn't set up AWDL pause"
+                alert.informativeText = error.localizedDescription
+                alert.runModal()
+                return
+            }
+        }
+        if service.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
+        server.refreshAWDLPause()
+    }
 
     @objc private func forgetPC(_ sender: NSMenuItem) {
         let paired = TrustStore.shared.all

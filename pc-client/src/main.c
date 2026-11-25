@@ -64,6 +64,7 @@ enum {
     MSG_TAKEOVER = 0x84,
     MSG_GOODBYE = 0x85,
     MSG_CONFIRM = 0x86,
+    MSG_VIEWING = 0x87,
     MSG_INPUT = 0x90,
 };
 
@@ -1213,6 +1214,10 @@ static void set_mac_mode(int on) {
         return;
     }
     g_mac_mode = on;
+    if (SDL_AtomicGet(&g_connected)) {
+        uint8_t viewing = on != 0;
+        send_msg(MSG_VIEWING, 0, &viewing, 1);
+    }
     if (on) {
         // Bring up every Mac window and focus the one on the monitor the PC cursor is on.
         // The Mac cursor jumps to the same spot, so switching feels continuous.

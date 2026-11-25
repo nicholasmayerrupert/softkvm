@@ -58,6 +58,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+if CommandLine.arguments.contains("--awdl-helper") { AWDLHelper.run() }
+
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate

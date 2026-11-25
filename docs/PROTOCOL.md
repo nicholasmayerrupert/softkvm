@@ -116,6 +116,7 @@ Before `OK`, the host only accepts `TAKEOVER` and `GOODBYE`.
 | `0x83` | MONITORS | `str client name, u8 n`, n × `u8 index, u8 selected, u32 w, h, hz, str name`: every client monitor |
 | `0x84` | TAKEOVER | (empty) after `BUSY`: take control from the client in control |
 | `0x86` | CONFIRM | `u8 flags`, first record (see above) |
+| `0x87` | VIEWING | `u8 viewing`: 1 showing the streamed desktop, 0 in PC mode. Optional, ignored by earlier hosts. |
 | `0xA0` | TIME_REQUEST | `u64 client_us`. Clients send it every second once authorized; the host drops an authorized client silent for 5 s. |
 | `0x85` | GOODBYE | `u8 reason`: 0 quitting (host removes its displays), 1 switching to another device (host keeps them for a while) |
 | `0x90` | INPUT | `u8 kind` + fields, see below |

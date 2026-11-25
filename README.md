@@ -43,7 +43,15 @@ itself. Everything between paired devices is encrypted.
 - **Start with Windows**, **Open log**, **Quit**. **Ctrl+Alt+Q** quits while controlling a device.
 
 **Mac (menu-bar icon):** connection status, the PC's monitors (same checkboxes), **Paired PCs**
-(Forget), **Video quality**, **Disconnect PC**, **Permissions**, **Launch at Login**, **Open Log**.
+(Forget), **Video quality**, **Pause AWDL while streaming**, **Disconnect PC**, **Permissions**,
+**Launch at Login**, **Open Log**.
+
+If AirDrop causes periodic Wi-Fi stutter, enable **Pause AWDL while streaming** in the Mac
+menu. This requires the updated Mac host and Windows client, and one-time approval for the SoftKVM
+background helper in System Settings → General → Login Items & Extensions. SoftKVM saves
+the option and applies it automatically when launched at login. AirDrop and other nearby Apple features
+may be temporarily unavailable while the PC shows the Mac desktop. SoftKVM restores AWDL
+when you return to PC mode, disconnect, or quit the host.
 
 **One PC at a time.** If another PC is controlling a Mac, the device shows "in use by ‹PC›"; clicking
 it offers to take over. A Mac you disconnect from its menu stays disconnected until you reconnect from

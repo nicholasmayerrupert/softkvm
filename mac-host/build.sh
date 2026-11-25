@@ -7,7 +7,8 @@ cd "$(dirname "$0")"
 swift build -c release
 APP=SoftKVMHost.app
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Library/LaunchDaemons"
+cp Resources/dev.softkvm.host.awdl.plist "$APP/Contents/Library/LaunchDaemons/"
 cp .build/release/SoftKVMHost "$APP/Contents/MacOS/"
 cp Resources/Info.plist "$APP/Contents/"
 VERSION=$(cat ../VERSION 2>/dev/null || echo 0.0.0)

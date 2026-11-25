@@ -9,6 +9,7 @@ import Network
 /// and may take over.
 final class Server: @unchecked Sendable {
     let queue = DispatchQueue(label: "softkvm.server")
+    private lazy var awdl = AWDLPause(queue: queue)
     private var listener: NWListener?
     private(set) var active: ClientSession?
     private var waiting: [ClientSession] = []  // handshaking, awaiting approval, or told "busy"
@@ -67,6 +68,16 @@ final class Server: @unchecked Sendable {
 
     // MARK: - Menu actions (any thread)
 
+    func refreshAWDLPause() {
+        queue.async { self.awdl.refresh() }
+    }
+
+    func setViewing(_ viewing: Bool, for session: ClientSession) {
+        if active === session && !HostEnv.perf && !Proto.headless {
+            awdl.setViewing(viewing)
+        }
+    }
+
     func setBitrate(_ bitrate: Int) {
         queue.async {
             self.bitrate = bitrate
@@ -89,6 +100,7 @@ final class Server: @unchecked Sendable {
     func shutdown(reason: String) {
         queue.sync {
             Log.info("server: \(reason); saying goodbye to connected PCs")
+            awdl.setViewing(false)
             if let a = active {
                 active = nil
                 a.sayGoodbye(.hostQuitting, "")
@@ -177,6 +189,7 @@ final class Server: @unchecked Sendable {
 
     private func makeActive(_ s: ClientSession, code: Proto.AuthCode) {
         waiting.removeAll { $0 === s }
+        awdl.setViewing(false)
         active = s
         s.state = .authorized
         s.sendAuth(code, "")
@@ -504,6 +517,10 @@ final class ClientSession: @unchecked Sendable {
             }
         case .input:
             if !HostEnv.perf { injector.handle(payload) }
+        case .viewing:
+            if state == .streaming, payload.count == 1, let viewing = payload.first, viewing <= 1 {
+                server?.setViewing(viewing == 1, for: self)
+            }
         case .monitors:
             handleMonitors(payload)
         default:
@@ -547,6 +564,7 @@ final class ClientSession: @unchecked Sendable {
     /// With `flushFirst`, the socket is closed after already-queued data is sent (at most 2 s).
     func close(reason: String, keepDisplays: Bool, flushFirst: Bool = false) {
         guard state != .closed else { return }
+        server?.setViewing(false, for: self)
         if state == .waitingForApproval, !pairingCode.isEmpty {
             let code = pairingCode
             PairingPrompt.cancel(code: code)  // nobody left to approve

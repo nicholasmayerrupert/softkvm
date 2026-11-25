@@ -43,6 +43,8 @@ enum Proto {
         /// First record after the handshake (key confirmation): u8 flags, bit 0 = "show the
         /// pairing prompt even if you already trust me" (the client doesn't know this Mac yet).
         case confirm = 0x86
+        /// u8 viewing: 1 while the client is showing the streamed desktop, 0 in PC mode.
+        case viewing = 0x87
         case input = 0x90
     }
 
