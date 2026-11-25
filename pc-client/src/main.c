@@ -1208,6 +1208,21 @@ static int stream_for_window(Uint32 window_id) {
     return -1;
 }
 
+static void raise_stream_window(SDL_Window *win) {
+    SDL_SysWMinfo wm;
+    SDL_VERSION(&wm.version);
+    if (!SDL_GetWindowWMInfo(win, &wm)) return;
+
+    // Moving through the topmost group puts this window above other desktop windows even
+    // when reconnecting took long enough for Windows to restrict foreground activation.
+    HWND hwnd = wm.info.win.window;
+    UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+    if (!SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags) ||
+        !SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)) {
+        LOG("window: could not raise stream (%lu)", GetLastError());
+    }
+}
+
 static void set_mac_mode(int on) {
     if (g_perf_bench_secs) {  // benchmarks never show windows or grab input
         g_mac_mode = on;
@@ -1239,6 +1254,7 @@ static void set_mac_mode(int on) {
             }
             g_streams[i].dirty = 1;
         }
+        for (int i = 0; i < g_nstreams; i++) raise_stream_window(g_streams[i].win);
         SDL_RaiseWindow(g_streams[focus].win);
         SDL_SetWindowKeyboardGrab(g_streams[focus].win, SDL_TRUE);
         // Relative mode: Windows' cursor is hidden and pinned; we get raw movement (with the
