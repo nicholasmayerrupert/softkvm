@@ -1543,7 +1543,9 @@ static void start_session(void) {
     snprintf(g_hint_addr, sizeof g_hint_addr, "%s", g_devrt[g_cfg.active].hint_addr);
     g_hint_port = g_devrt[g_cfg.active].hint_port;
     SDL_UnlockMutex(g_shared_lock);
-    set_dev_state(g_cfg.active, DEV_CONNECTING, "");
+    // A rebuild (e.g. a monitor change) while disconnected on purpose stays paused: the net thread
+    // won't connect, and "connecting…" would hide the click that resumes it.
+    if (!SDL_AtomicGet(&g_paused)) set_dev_state(g_cfg.active, DEV_CONNECTING, "");
     SDL_AtomicSet(&g_net_stop, 0);
     g_net_thread = SDL_CreateThread(net_thread, "net", NULL);
 }
@@ -1827,7 +1829,12 @@ static void use_active_device(void) {
         g_want_mac_on_connect = 1;
         break;
     default:
-        if (g_mac_mode) set_mac_mode(0);
+        if (SDL_AtomicGet(&g_paused)) {  // shown as something else but not trying: resume
+            LOG("device: reconnecting to %s", g_cfg.devices[i].name);
+            SDL_AtomicSet(&g_paused, 0);
+            set_dev_state(i, DEV_CONNECTING, "");
+            g_want_mac_on_connect = 1;
+        } else if (g_mac_mode) set_mac_mode(0);
         break;
     }
 }
