@@ -1348,8 +1348,19 @@ static int forward_input(const SDL_Event *ev) {
 static void stop_session(int goodbye);
 static void restart_session(void);
 
-/// True if a monitor we're showing the device on went away or moved/resized.
+/// True if a monitor we're showing the device on went away or moved/resized, or if the selected
+/// monitors no longer match the streams (e.g. a selected monitor woke up or was plugged back in:
+/// while it was off the session was rebuilt without it, and it must be added back).
 static int streamed_monitors_changed(void) {
+    if (!g_cli_monitors && g_net_thread) {
+        int n = 0;
+        for (int i = 0; i < g_npcmons; i++) {
+            if (!g_pcmons[i].selected) continue;
+            if (n >= g_nstreams || g_streams[n].monitor != i) return 1;
+            n++;
+        }
+        if (n != g_nstreams) return 1;
+    }
     for (int i = 0; i < g_nstreams; i++) {
         SDL_Rect b = {0, 0, 0, 0};
         if (g_streams[i].monitor >= SDL_GetNumVideoDisplays() || SDL_GetDisplayBounds(g_streams[i].monitor, &b) != 0)
